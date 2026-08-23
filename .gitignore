@@ -1,0 +1,30 @@
+# Android and Gradle generated files
+.gradle/
+**/build/
+local.properties
+
+# Local SDK/JDK and caches
+toolcache/
+.gradle-cache/
+.android/
+
+# Generated packages
+*.apk
+*.aab
+*.apks
+FoxKifuScanner-source-*.zip
+
+# Signing keys and certificates
+*.jks
+*.keystore
+*.p12
+*.pem
+
+# Test captures and private input files
+upload/
+
+# IDE and operating-system files
+.idea/
+*.iml
+.DS_Store
+Thumbs.db

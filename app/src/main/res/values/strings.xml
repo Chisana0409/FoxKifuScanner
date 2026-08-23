@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">野狐棋譜スキャナー</string>
+    <string name="accessibility_description">野狐囲碁の棋譜画面を一手ずつ操作し、盤面を読み取ります。</string>
+</resources>
