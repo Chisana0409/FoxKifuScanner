@@ -1,6 +1,7 @@
 package jp.chisana.foxkifuscanner;
 
 import static org.junit.Assert.*;
+import android.graphics.Bitmap;
 import java.time.LocalDate;
 import java.util.List;
 import org.junit.Test;
@@ -35,6 +36,81 @@ public class CoreTest {
         assertEquals("W+0.5", MetadataReader.parseResult("白 半目勝ち"));
         assertEquals("B+3.5", MetadataReader.parseResult("黒 3目半勝ち"));
         assertEquals("0", MetadataReader.parseResult("持碁"));
+    }
+
+    @Test public void nameScriptSelectionPrefersJapaneseWhenShortHanIsAmbiguous() {
+        int japanese = NameScriptSelector.score("林", NameScriptSelector.OcrModel.JAPANESE,
+                .82f, "ja");
+        int chinese = NameScriptSelector.score("林", NameScriptSelector.OcrModel.CHINESE,
+                .82f, "zh");
+        assertTrue(japanese > chinese);
+    }
+
+    @Test public void nameScriptSelectionRecognizesClearChineseAndJapaneseEvidence() {
+        int simplifiedChinese = NameScriptSelector.score("陈龙",
+                NameScriptSelector.OcrModel.CHINESE, .80f, "zh");
+        int japaneseLookAlike = NameScriptSelector.score("陳竜",
+                NameScriptSelector.OcrModel.JAPANESE, .80f, "ja");
+        assertTrue(simplifiedChinese > japaneseLookAlike);
+        assertEquals(NameScriptSelector.ScriptKind.JAPANESE,
+                NameScriptSelector.classify("ひかる碁"));
+        assertEquals(NameScriptSelector.ScriptKind.LATIN,
+                NameScriptSelector.classify("V532816174"));
+    }
+
+    @Test public void clearChineseConfidenceCanOverrideDefaultJapaneseTieBreak() {
+        int japanese = NameScriptSelector.score("張偉", NameScriptSelector.OcrModel.JAPANESE,
+                .60f, "ja");
+        int chinese = NameScriptSelector.score("張偉", NameScriptSelector.OcrModel.CHINESE,
+                .95f, "zh");
+        assertTrue(chinese > japanese);
+    }
+
+    @Test public void fullChineseNameBeatsSingleKanaMisreadAcrossSameVisualSpan() {
+        int japaneseMisread = NameScriptSelector.score("ち",
+                NameScriptSelector.OcrModel.JAPANESE, 1.0f, "ja",
+                1326, 320, 1326);
+        int chineseName = NameScriptSelector.score("和平卫士",
+                NameScriptSelector.OcrModel.CHINESE, .75f, "zh",
+                1326, 320, 1326);
+        assertTrue(chineseName > japaneseMisread);
+    }
+
+    @Test public void fullChineseLineBeatsSingleKanaElementFromThatLine() {
+        int japaneseElement = NameScriptSelector.score("ち",
+                NameScriptSelector.OcrModel.JAPANESE, 1.0f, "ja",
+                76, 80, 320);
+        int chineseName = NameScriptSelector.score("和平卫士",
+                NameScriptSelector.OcrModel.CHINESE, .75f, "zh",
+                320, 80, 320);
+        assertTrue(chineseName > japaneseElement);
+    }
+
+    @Test public void genuineOneKanaNameStillKeepsJapanesePriority() {
+        int japanese = NameScriptSelector.score("ち",
+                NameScriptSelector.OcrModel.JAPANESE, .80f, "ja",
+                76, 80, 76);
+        int chinese = NameScriptSelector.score("池",
+                NameScriptSelector.OcrModel.CHINESE, .80f, "zh",
+                76, 80, 76);
+        assertTrue(japanese > chinese);
+    }
+
+    @Test public void longLatinAccountNameIsNotDisplacedByChineseLookAlike() {
+        int latin = NameScriptSelector.score("V532816174",
+                NameScriptSelector.OcrModel.JAPANESE, .80f, "en",
+                464, 80, 464);
+        int chineseLookAlike = NameScriptSelector.score("和平卫士",
+                NameScriptSelector.OcrModel.CHINESE, .80f, "zh",
+                320, 80, 464);
+        assertTrue(latin > chineseLookAlike);
+    }
+
+    @Test public void ocrPipelineKeepsTheStableListMetadataAbi() throws Exception {
+        assertEquals(List.class, HeaderTextRecognizer.class.getDeclaredMethod(
+                "recognize", Bitmap.class, BoardAnalyzer.Region.class).getReturnType());
+        assertNotNull(MetadataReader.class.getDeclaredMethod("read", Bitmap.class,
+                BoardAnalyzer.Region.class, List.class, List.class));
     }
 
     @Test public void captureIsLegalDifference() {
