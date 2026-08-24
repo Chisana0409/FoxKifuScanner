@@ -9,8 +9,8 @@ android {
         applicationId 'jp.chisana.foxkifuscanner'
         minSdk 30
         targetSdk 35
-        versionCode 10201
-        versionName '1.2.1-speed'
+        versionCode 10300
+        versionName '1.3.0-all'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 
@@ -28,5 +28,6 @@ android {
 
 dependencies {
     implementation 'com.google.mlkit:text-recognition-japanese:16.0.1'
+    implementation 'com.google.mlkit:text-recognition-chinese:16.0.1'
     testImplementation 'junit:junit:4.13.2'
 }
