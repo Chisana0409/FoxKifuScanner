@@ -26,21 +26,32 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class ReaderAccessibilityService extends AccessibilityService {
     private static final int MAX_MOVES = 1000;
+    private static final long TARGET_TOTAL_MS = 10_000;
+    private static final long TARGET_SAVE_RESERVE_MS = 300;
+    private static final long FRESH_FRAME_WAIT_MS = 320;
+    private static final long OCR_BACKGROUND_TIMEOUT_MS = 1500;
+    private static final long TAP_DURATION_MS = 20;
+    private static final long PROGRESS_UPDATE_INTERVAL_MS = 150;
+    private static final double FAST_FRAME_MIN_CONFIDENCE = 0.78;
     private static volatile ReaderAccessibilityService instance;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService ocrWorker = Executors.newSingleThreadExecutor();
     private volatile boolean cancelled;
     private volatile boolean running;
     private volatile long terminalSignalUntil;
+    private volatile int activeMoveCount;
     private WindowManager windowManager;
     private View overlay;
     private TextView overlayStatus;
@@ -56,7 +67,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     }
 
     private record LightFrame(Bitmap bitmap, BoardFrameFingerprint fingerprint,
-                              double sliderProgress) {
+                              double sliderProgress, long sequence) {
         void recycle() {
             if (!bitmap.isRecycled()) bitmap.recycle();
         }
@@ -219,12 +230,16 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         cancelled = false;
         running = true;
         terminalSignalUntil = 0;
+        ScanMetrics metrics = new ScanMetrics();
+        activeMoveCount = 0;
         worker.execute(() -> {
             try {
-                scanGame();
+                scanGame(metrics);
             } catch (CancellationException e) {
+                metrics.finishCancelled(activeMoveCount);
                 publish("読み取りを停止しました（未保存）");
             } catch (Throwable e) {
+                metrics.finishFailure(activeMoveCount, e);
                 String message = "処理を停止しました：" + cleanMessage(e);
                 publish(message);
                 main.post(() -> Toast.makeText(this, message, Toast.LENGTH_LONG).show());
@@ -235,38 +250,42 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         });
     }
 
-    private void scanGame() throws Exception {
+    private void scanGame(ScanMetrics metrics) throws Exception {
+        long setupStarted = metrics.mark();
         publish("1/3 画面画像を取得中…");
-        Frame first = captureFrame(null);
+        Frame first = captureLatestFrame(null);
         first = recoverBlockingDialog(first);
         publish("2/3 盤面を検出しました");
         dockOverlayBelowBoard(first.detection().board());
         first.recycle();
 
         Thread.sleep(180);
-        first = captureFrame(null);
+        first = captureLatestFrame(null);
         first = recoverBlockingDialog(first);
         ScreenGeometry geometry = ScreenGeometry.detect(first.bitmap(), first.detection().board());
+        metrics.addPhase("setup", setupStarted);
 
         publish("3/3 対局情報を画像認識中…");
+        long accessibilityStarted = metrics.mark();
         List<MetadataReader.UiText> accessibilityTexts = collectWindowTextsOnMain();
-        List<MetadataReader.UiText> ocrTexts = List.of();
-        try {
-            ocrTexts = HeaderTextRecognizer.recognize(first.bitmap(), first.detection().board());
-        } catch (Throwable ignored) {
-            publish("画像OCRを利用できないため、画面テキストで読取を継続します");
-        }
+        metrics.addPhase("accessibility", accessibilityStarted);
+
         GameMetadata meta;
+        CompletableFuture<GameMetadata> enhancedMetadata;
         try {
             meta = MetadataReader.read(first.bitmap(), first.detection().board(),
-                    accessibilityTexts, ocrTexts);
+                    accessibilityTexts, List.of());
+            enhancedMetadata = startMetadataEnhancement(
+                    first.bitmap(), first.detection().board(), accessibilityTexts, meta, metrics);
+            publish("認識結果：黒 " + meta.blackDisplay() + "／白 " + meta.whiteDisplay()
+                    + (meta.result.isBlank() ? "" : "／結果 " + meta.result));
         } finally {
             first.recycle();
         }
-        publish("認識結果：黒 " + meta.blackDisplay() + "／白 " + meta.whiteDisplay()
-                + (meta.result.isBlank() ? "" : "／結果 " + meta.result));
 
+        long rewindStarted = metrics.mark();
         Frame initial = rewindToInitial(geometry, meta);
+        metrics.addPhase("rewind", rewindStarted);
         BoardState current = initial.detection().state();
         BoardFrameFingerprint fingerprint = BoardFrameFingerprint.capture(
                 new BitmapPixels(initial.bitmap()), geometry.board);
@@ -276,18 +295,29 @@ public final class ReaderAccessibilityService extends AccessibilityService {
 
         List<Move> moves = new ArrayList<>();
         byte expected = meta.handicap > 1 ? BoardState.WHITE : BoardState.BLACK;
+        long replayStarted = metrics.mark();
+        long lastProgressUpdate = 0L;
         for (int turn = 1; turn <= MAX_MOVES; turn++) {
             checkCancelled();
-            publish("棋譜読取中：" + moves.size() + "手");
-            Outcome outcome = advanceOne(geometry, current, fingerprint, progress, expected);
+            long now = SystemClock.uptimeMillis();
+            if (turn == 1 || now - lastProgressUpdate >= PROGRESS_UPDATE_INTERVAL_MS) {
+                setOverlayStatus("棋譜読取中：" + moves.size() + "手");
+                lastProgressUpdate = now;
+            }
+            Outcome outcome = advanceOne(geometry, current, fingerprint, progress, expected, metrics);
             if (outcome.type() == OutcomeType.END) {
-                saveCompletedGame(meta, moves);
+                metrics.addPhase("replay", replayStarted);
+                checkCancelled();
+                meta = resolveMetadata(meta, enhancedMetadata, metrics);
+                checkCancelled();
+                saveCompletedGame(meta, moves, metrics);
                 return;
             }
             if (outcome.type() == OutcomeType.FAILURE) {
                 throw new IllegalStateException(outcome.message() + "。SGFは保存していません");
             }
             moves.add(outcome.move());
+            activeMoveCount = moves.size();
             current = outcome.after();
             fingerprint = outcome.fingerprint();
             progress = outcome.sliderProgress();
@@ -296,14 +326,100 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         throw new IllegalStateException(MAX_MOVES + "手に到達しても終局を確認できません。SGFは保存していません");
     }
 
-    private void saveCompletedGame(GameMetadata meta, List<Move> moves) throws Exception {
+    private void saveCompletedGame(GameMetadata meta, List<Move> moves,
+                                   ScanMetrics metrics) throws Exception {
+        checkCancelled();
+        long saveStarted = metrics.mark();
         publish("SGFを保存中…");
         LocalDate date = LocalDate.now();
         String sgf = SgfWriter.build(meta, moves, date);
+        checkCancelled();
         SgfStore.save(this, meta, sgf, date);
+        metrics.addPhase("save", saveStarted);
+        metrics.finishSuccess(moves.size());
         publish("保存完了：Download/" + safeName(meta.blackName) + "_vs_"
                 + safeName(meta.whiteName) + "_" + date.toString().replace("-", "")
-                + ".sgf（" + moves.size() + "手）");
+                + ".sgf（" + moves.size() + "手／"
+                + String.format(java.util.Locale.ROOT, "%.2f", metrics.elapsedSeconds()) + "秒）");
+    }
+
+    private CompletableFuture<GameMetadata> startMetadataEnhancement(
+            Bitmap screen, BoardAnalyzer.Region board,
+            List<MetadataReader.UiText> accessibilityTexts,
+            GameMetadata fallback, ScanMetrics metrics) {
+        if (metadataComplete(fallback)) return CompletableFuture.completedFuture(fallback);
+
+        int headerHeight = Math.max(1, Math.min(screen.getHeight(), board.top()));
+        Bitmap header = Bitmap.createBitmap(screen, 0, 0, screen.getWidth(), headerHeight);
+        metrics.ocrStarted();
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                List<MetadataReader.UiText> ocrTexts = HeaderTextRecognizer.recognize(
+                        header, board, OCR_BACKGROUND_TIMEOUT_MS);
+                return MetadataReader.read(header, board, accessibilityTexts, ocrTexts);
+            } catch (HeaderTextRecognizer.RecognitionTimeoutException timeout) {
+                metrics.ocrTimedOut();
+                return fallback;
+            } catch (Throwable ignored) {
+                return fallback;
+            } finally {
+                metrics.ocrFinished();
+                if (!header.isRecycled()) header.recycle();
+            }
+        }, ocrWorker);
+    }
+
+    private GameMetadata resolveMetadata(GameMetadata scanMetadata,
+                                         CompletableFuture<GameMetadata> enhanced,
+                                         ScanMetrics metrics) {
+        long joinStarted = metrics.mark();
+        GameMetadata resolved = scanMetadata;
+        long joinBudgetMs = Math.min(OCR_BACKGROUND_TIMEOUT_MS,
+                Math.max(0L, TARGET_TOTAL_MS - TARGET_SAVE_RESERVE_MS
+                        - metrics.elapsedMillis()));
+        try {
+            if (enhanced.isDone()) resolved = enhanced.get();
+            else if (joinBudgetMs > 0L) {
+                resolved = enhanced.get(joinBudgetMs, TimeUnit.MILLISECONDS);
+            } else {
+                throw new TimeoutException("10秒の処理時間枠を使い切りました");
+            }
+        } catch (TimeoutException timeout) {
+            enhanced.cancel(false);
+            metrics.ocrTimedOut();
+            publish("対局情報OCRの完了を待たず、棋譜を保存します");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            CancellationException cancellation = new CancellationException();
+            cancellation.initCause(interrupted);
+            throw cancellation;
+        } catch (Throwable ignored) {
+            // The accessibility-derived metadata remains a complete safe fallback.
+        } finally {
+            metrics.addPhase("ocrJoin", joinStarted);
+        }
+
+        if (resolved == null) resolved = scanMetadata;
+        resolved.initialPosition = scanMetadata.initialPosition;
+        if (scanMetadata.handicap > 1) {
+            resolved.handicap = scanMetadata.handicap;
+            resolved.handicapText = scanMetadata.handicapText;
+        }
+        publish("確定情報：黒 " + resolved.blackDisplay() + "／白 "
+                + resolved.whiteDisplay()
+                + (resolved.result.isBlank() ? "" : "／結果 " + resolved.result));
+        return resolved;
+    }
+
+    private static boolean metadataComplete(GameMetadata meta) {
+        return meta != null
+                && meta.blackName != null && !meta.blackName.isBlank()
+                && !meta.blackName.contains("不明")
+                && meta.whiteName != null && !meta.whiteName.isBlank()
+                && !meta.whiteName.contains("不明")
+                && !meta.blackRank.isBlank()
+                && !meta.whiteRank.isBlank()
+                && !meta.result.isBlank();
     }
 
     private Frame rewindToInitial(ScreenGeometry geometry, GameMetadata meta) throws Exception {
@@ -364,11 +480,16 @@ public final class ReaderAccessibilityService extends AccessibilityService {
 
     private Outcome advanceOne(ScreenGeometry geometry, BoardState before,
                                BoardFrameFingerprint beforeFingerprint,
-                               double beforeProgress, byte expected) throws Exception {
+                               double beforeProgress, byte expected,
+                               ScanMetrics metrics) throws Exception {
         for (int attempt = 0; attempt < 3; attempt++) {
             checkCancelled();
+            if (attempt > 0) metrics.retriedMove();
             terminalSignalUntil = 0;
+            long afterSequence = CaptureService.currentSequence();
+            long gestureStarted = metrics.mark();
             gestureTap(geometry, geometry.forward);
+            metrics.addGesture(gestureStarted);
             long start = SystemClock.uptimeMillis();
             BoardFrameFingerprint candidate = null;
             int sameCandidate = 0;
@@ -377,40 +498,68 @@ public final class ReaderAccessibilityService extends AccessibilityService {
 
             while (SystemClock.uptimeMillis() - start < 2400) {
                 checkCancelled();
-                LightFrame frame = captureLightFrame(geometry);
-                boolean banner = TerminalBannerDetector.hasBanner(
-                        new BitmapPixels(frame.bitmap()), geometry.board);
-                if (terminalRecently()) {
-                    double p = usableProgress(frame.sliderProgress(), beforeProgress);
-                    frame.recycle();
-                    return new Outcome(OutcomeType.END, null, before, beforeFingerprint, p,
-                            "終局メッセージ");
+                LightFrame frame = captureLightFrameAfter(
+                        geometry, afterSequence, FRESH_FRAME_WAIT_MS, metrics);
+                if (frame == null) {
+                    if (SystemClock.uptimeMillis() - start > 500 && !checkedWindowText) {
+                        checkedWindowText = true;
+                        if (terminalRecently() || windowHasTerminalText()) {
+                            return new Outcome(OutcomeType.END, null, before,
+                                    beforeFingerprint, beforeProgress, "終局メッセージ");
+                        }
+                    }
+                    continue;
                 }
+                afterSequence = Math.max(afterSequence, frame.sequence());
+                boolean terminalSignaled = terminalRecently();
+                boolean banner = SystemClock.uptimeMillis() - start >= 180
+                        && TerminalBannerDetector.hasBanner(
+                        new BitmapPixels(frame.bitmap()), geometry.board);
                 if (banner) {
                     bannerSightings++;
-                    if (bannerSightings >= 2) {
-                        double p = usableProgress(frame.sliderProgress(), beforeProgress);
-                        frame.recycle();
-                        return new Outcome(OutcomeType.END, null, before, beforeFingerprint, p,
-                                "終局バナー");
-                    }
                 } else {
                     bannerSightings = 0;
                 }
 
                 BoardFrameFingerprint observedFingerprint = frame.fingerprint();
                 if (!observedFingerprint.equals(beforeFingerprint)) {
-                    if (observedFingerprint.equals(candidate)) sameCandidate++;
+                    boolean newCandidate = !observedFingerprint.equals(candidate);
+                    BoardAnalyzer.Detection candidateDetection = null;
+                    if (newCandidate) {
+                        long analyzeStarted = metrics.mark();
+                        candidateDetection = analyzeLightDetection(frame, geometry);
+                        metrics.addBoardAnalysis(analyzeStarted);
+                        MoveDetector.Result fastDiff = MoveDetector.between(
+                                before, candidateDetection.state(), expected);
+                        if (isExactLegalTransition(before, candidateDetection.state(), fastDiff)
+                                && fastFrameCanCommit(candidateDetection, beforeProgress,
+                                frame.sliderProgress())) {
+                            double p = usableProgress(frame.sliderProgress(), beforeProgress);
+                            frame.recycle();
+                            metrics.acceptedFastMove();
+                            return new Outcome(OutcomeType.MOVE, fastDiff.move(),
+                                    candidateDetection.state(), observedFingerprint, p, "fast");
+                        }
+                    }
+                    if (!newCandidate) sameCandidate++;
                     else {
                         candidate = observedFingerprint;
                         sameCandidate = 1;
                     }
                     if (sameCandidate >= 2) {
-                        BoardState observed = analyzeLightState(frame, geometry);
+                        BoardState observed;
+                        if (candidateDetection != null) {
+                            observed = candidateDetection.state();
+                        } else {
+                            long analyzeStarted = metrics.mark();
+                            observed = analyzeLightState(frame, geometry);
+                            metrics.addBoardAnalysis(analyzeStarted);
+                        }
                         MoveDetector.Result diff = MoveDetector.between(before, observed, expected);
-                        if (diff.legal()) {
+                        if (isExactLegalTransition(before, observed, diff)) {
                             double p = usableProgress(frame.sliderProgress(), beforeProgress);
                             frame.recycle();
+                            metrics.acceptedVerifiedMove();
                             return new Outcome(OutcomeType.MOVE, diff.move(), observed,
                                     observedFingerprint, p, "ok");
                         }
@@ -418,6 +567,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
                                 && progressAdvanced(beforeProgress, frame.sliderProgress())) {
                             double p = frame.sliderProgress();
                             frame.recycle();
+                            metrics.acceptedVerifiedMove();
                             return new Outcome(OutcomeType.PASS, Move.pass(expected), before,
                                     observedFingerprint, p, "pass");
                         }
@@ -425,47 +575,51 @@ public final class ReaderAccessibilityService extends AccessibilityService {
                         sameCandidate = 0;
                     }
                 } else if (SystemClock.uptimeMillis() - start > 500) {
-                    if (!checkedWindowText) {
-                        checkedWindowText = true;
-                        if (windowHasTerminalText()) {
-                            double p = usableProgress(frame.sliderProgress(), beforeProgress);
-                            frame.recycle();
-                            return new Outcome(OutcomeType.END, null, before,
-                                    beforeFingerprint, p, "終局メッセージ");
-                        }
-                    }
                     if (progressAdvanced(beforeProgress, frame.sliderProgress())) {
+                        long analyzeStarted = metrics.mark();
                         BoardState observed = analyzeLightState(frame, geometry);
+                        metrics.addBoardAnalysis(analyzeStarted);
                         if (observed.equals(before)) {
                             double p = frame.sliderProgress();
                             frame.recycle();
+                            metrics.acceptedVerifiedMove();
                             return new Outcome(OutcomeType.PASS, Move.pass(expected), before,
                                     observedFingerprint, p, "pass");
                         }
                         MoveDetector.Result diff = MoveDetector.between(before, observed, expected);
-                        if (diff.legal()) {
+                        if (isExactLegalTransition(before, observed, diff)) {
                             double p = frame.sliderProgress();
                             frame.recycle();
+                            metrics.acceptedVerifiedMove();
                             return new Outcome(OutcomeType.MOVE, diff.move(), observed,
                                     observedFingerprint, p, "ok");
                         }
                     }
                 }
+
+                long elapsed = SystemClock.uptimeMillis() - start;
+                boolean windowTerminal = false;
+                if (elapsed > 500 && !checkedWindowText) {
+                    checkedWindowText = true;
+                    windowTerminal = windowHasTerminalText();
+                }
+                if ((terminalSignaled && elapsed >= 120)
+                        || bannerSightings >= 2 || windowTerminal) {
+                    double p = usableProgress(frame.sliderProgress(), beforeProgress);
+                    frame.recycle();
+                    return new Outcome(OutcomeType.END, null, before, beforeFingerprint, p,
+                            bannerSightings >= 2 ? "終局バナー" : "終局メッセージ");
+                }
                 frame.recycle();
-                Thread.sleep(35);
             }
 
             // The sparse fingerprint controls polling only.  Before accepting a move,
             // always run the complete detector against the settled bitmap.
-            LightFrame settled = awaitLightStable(geometry, null, 900);
+            LightFrame settled = awaitLightStable(geometry, null, 900, metrics);
             boolean settledBanner = TerminalBannerDetector.hasBanner(
                     new BitmapPixels(settled.bitmap()), geometry.board);
-            if (terminalRecently() || settledBanner || windowHasTerminalText()) {
-                double p = usableProgress(settled.sliderProgress(), beforeProgress);
-                settled.recycle();
-                return new Outcome(OutcomeType.END, null, before, beforeFingerprint, p,
-                        "終局メッセージ");
-            }
+            boolean settledTerminal = terminalRecently() || settledBanner
+                    || windowHasTerminalText();
             BoardFrameFingerprint settledFingerprint = settled.fingerprint();
             boolean fingerprintChanged = !settledFingerprint.equals(beforeFingerprint);
 
@@ -473,29 +627,47 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             // This is the same guarded retry used by the real-device-tested speed branch.
             if (fingerprintChanged
                     && beforeProgress >= 0
-                    && !progressAdvanced(beforeProgress, settled.sliderProgress())) {
+                    && !progressAdvanced(beforeProgress, settled.sliderProgress())
+                    && !settledTerminal) {
                 settled.recycle();
                 continue;
             }
 
+            long analyzeStarted = metrics.mark();
             BoardState settledState = analyzeLightState(settled, geometry);
+            metrics.addBoardAnalysis(analyzeStarted);
             if (settledState.equals(before)) {
                 if (progressAdvanced(beforeProgress, settled.sliderProgress())) {
                     double p = settled.sliderProgress();
                     settled.recycle();
+                    metrics.acceptedVerifiedMove();
                     return new Outcome(OutcomeType.PASS, Move.pass(expected), before,
                             settledFingerprint, p, "pass");
+                }
+                if (settledTerminal) {
+                    double p = usableProgress(settled.sliderProgress(), beforeProgress);
+                    settled.recycle();
+                    return new Outcome(OutcomeType.END, null, before, beforeFingerprint, p,
+                            settledBanner ? "終局バナー" : "終局メッセージ");
                 }
                 settled.recycle();
                 continue;
             }
 
             MoveDetector.Result settledDiff = MoveDetector.between(before, settledState, expected);
-            if (settledDiff.legal()) {
+            if (isExactLegalTransition(before, settledState, settledDiff)) {
                 double p = usableProgress(settled.sliderProgress(), beforeProgress);
                 settled.recycle();
+                metrics.acceptedVerifiedMove();
                 return new Outcome(OutcomeType.MOVE, settledDiff.move(), settledState,
                         settledFingerprint, p, "ok");
+            }
+
+            if (settledTerminal) {
+                double p = usableProgress(settled.sliderProgress(), beforeProgress);
+                settled.recycle();
+                return new Outcome(OutcomeType.END, null, before, beforeFingerprint, p,
+                        settledBanner ? "終局バナー" : "終局メッセージ");
             }
 
             // A changed but invalid frame is rolled back before any retry. If the exact prior
@@ -513,6 +685,20 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         }
         return new Outcome(OutcomeType.FAILURE, null, before, beforeFingerprint,
                 beforeProgress, "一手進む操作後に、着手・パス・終局のいずれも確認できません");
+    }
+
+    private static boolean fastFrameCanCommit(BoardAnalyzer.Detection detection,
+                                              double beforeProgress,
+                                              double afterProgress) {
+        return progressAdvanced(beforeProgress, afterProgress)
+                && detection.confidence() >= FAST_FRAME_MIN_CONFIDENCE;
+    }
+
+    private static boolean isExactLegalTransition(BoardState before, BoardState observed,
+                                                  MoveDetector.Result result) {
+        if (!result.legal()) return false;
+        BoardState expected = GoBoardRules.apply(before, result.move());
+        return expected != null && expected.equals(observed);
     }
 
     private static boolean progressAdvanced(double before, double after) {
@@ -550,14 +736,14 @@ public final class ReaderAccessibilityService extends AccessibilityService {
 
     private LightFrame awaitLightStable(ScreenGeometry geometry,
                                         BoardFrameFingerprint previous,
-                                        long timeout) throws Exception {
+                                        long timeout, ScanMetrics metrics) throws Exception {
         long start = SystemClock.uptimeMillis();
         BoardFrameFingerprint candidate = null;
         int repeats = 0;
         LightFrame held = null;
         while (SystemClock.uptimeMillis() - start < timeout) {
             checkCancelled();
-            LightFrame frame = captureLightFrame(geometry);
+            LightFrame frame = captureLightFrame(geometry, metrics);
             BoardFrameFingerprint fingerprint = frame.fingerprint();
             if (fingerprint.equals(candidate)) repeats++;
             else {
@@ -576,27 +762,70 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     }
 
     private BoardState analyzeLightState(LightFrame frame, ScreenGeometry geometry) {
-        return BoardAnalyzer.detect(new BitmapPixels(frame.bitmap()), geometry.board).state();
+        return analyzeLightDetection(frame, geometry).state();
     }
 
-    private LightFrame captureLightFrame(ScreenGeometry geometry) throws Exception {
+    private BoardAnalyzer.Detection analyzeLightDetection(LightFrame frame,
+                                                           ScreenGeometry geometry) {
+        return BoardAnalyzer.detect(new BitmapPixels(frame.bitmap()), geometry.board);
+    }
+
+    private LightFrame captureLightFrame(ScreenGeometry geometry, ScanMetrics metrics)
+            throws Exception {
+        long acquireStarted = metrics.mark();
         Bitmap bitmap = CaptureService.capture(700);
         if (bitmap == null) bitmap = captureWithAccessibility(1200);
+        metrics.addFreshFrameWait(acquireStarted, bitmap != null);
         if (bitmap == null) {
             throw new IllegalStateException("画面画像を取得できません。画面読取の許可をやり直してください");
         }
+        long lightStarted = metrics.mark();
         try {
             BoardFrameFingerprint fingerprint = BoardFrameFingerprint.capture(
                     new BitmapPixels(bitmap), geometry.board);
-            return new LightFrame(bitmap, fingerprint, geometry.sliderProgress(bitmap));
+            return new LightFrame(bitmap, fingerprint, geometry.sliderProgress(bitmap),
+                    CaptureService.currentSequence());
         } catch (RuntimeException | Error error) {
             bitmap.recycle();
             throw error;
+        } finally {
+            metrics.addLightAnalysis(lightStarted);
+        }
+    }
+
+    private LightFrame captureLightFrameAfter(ScreenGeometry geometry, long afterSequence,
+                                               long timeoutMs, ScanMetrics metrics) throws Exception {
+        long acquireStarted = metrics.mark();
+        CaptureService.CapturedFrame captured = CaptureService.captureAfter(afterSequence, timeoutMs);
+        metrics.addFreshFrameWait(acquireStarted, captured != null);
+        if (captured == null) return null;
+        Bitmap bitmap = captured.bitmap();
+        long lightStarted = metrics.mark();
+        try {
+            BoardFrameFingerprint fingerprint = BoardFrameFingerprint.capture(
+                    new BitmapPixels(bitmap), geometry.board);
+            return new LightFrame(bitmap, fingerprint, geometry.sliderProgress(bitmap),
+                    captured.sequence());
+        } catch (RuntimeException | Error error) {
+            bitmap.recycle();
+            throw error;
+        } finally {
+            metrics.addLightAnalysis(lightStarted);
         }
     }
 
     private Frame captureFrame(ScreenGeometry geometry) throws Exception {
         Bitmap bitmap = CaptureService.capture(1100);
+        if (bitmap == null) bitmap = captureWithAccessibility(2200);
+        if (bitmap == null) {
+            throw new IllegalStateException("画面画像を取得できません。画面読取の許可をやり直してください");
+        }
+        return analyzeFrame(bitmap, geometry);
+    }
+
+    private Frame captureLatestFrame(ScreenGeometry geometry) throws Exception {
+        CaptureService.CapturedFrame cached = CaptureService.latestFrame();
+        Bitmap bitmap = cached == null ? CaptureService.capture(1100) : cached.bitmap();
         if (bitmap == null) bitmap = captureWithAccessibility(2200);
         if (bitmap == null) {
             throw new IllegalStateException("画面画像を取得できません。画面読取の許可をやり直してください");
@@ -734,7 +963,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         Path path = new Path();
         path.moveTo(point.x, point.y);
         performGesture(new GestureDescription.Builder().addStroke(
-                new GestureDescription.StrokeDescription(path, 0, 70)).build());
+                new GestureDescription.StrokeDescription(path, 0, TAP_DURATION_MS)).build());
     }
 
     private void gestureSwipe(ScreenGeometry geometry, PointF from, PointF to,
@@ -933,6 +1162,8 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     @Override public void onDestroy() {
         cancelled = true;
         worker.shutdownNow();
+        ocrWorker.shutdownNow();
+        HeaderTextRecognizer.close();
         if (overlay != null) {
             try {
                 windowManager.removeView(overlay);
