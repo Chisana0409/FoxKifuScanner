@@ -3,6 +3,7 @@ package jp.chisana.foxkifuscanner;
 import android.graphics.Bitmap;
 import android.graphics.Rect;
 
+import com.google.android.gms.tasks.Task;
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.text.Text;
 import com.google.mlkit.vision.text.TextRecognition;
@@ -15,19 +16,34 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
 /** Reads only the game-information header. Board and advertisement text are excluded. */
 public final class HeaderTextRecognizer {
-    private static final long PASS_TIMEOUT_SECONDS = 12;
+    private static final long SCAN_TIMEOUT_SECONDS = 12;
+    private static final Object RECOGNITION_LOCK = new Object();
+    private static final Executor DIRECT_EXECUTOR = Runnable::run;
     private static final Pattern RANK_LIKE = Pattern.compile(
             "[0-9０-９一二三四五六七八九十IOIlｌ｜丨]+[級级段]");
     private static final Pattern NAME_TOKEN = Pattern.compile("[\\p{L}\\p{N}_.-]{1,32}");
     private static final String REJECTED_NAME_WORDS =
             "昇降級戦|互先|定先|先手|譲る|中盤|投了|時間切れ|不戦|勝ち|黒番|白番|"
                     + "絶芸|復盤|ポイント|形勢|研究|アイコン|キャンセル|確認|棋譜";
+
+    // Access is guarded by RECOGNITION_LOCK. Keeping the clients warm avoids loading both
+    // language models for every scan. close() is called from the owning service lifecycle.
+    private static TextRecognizer japaneseRecognizer;
+    private static TextRecognizer chineseRecognizer;
+
+    static final class RecognitionTimeoutException extends Exception {
+        RecognitionTimeoutException() {
+            super("対局情報OCRが時間内に完了しません");
+        }
+    }
 
     private HeaderTextRecognizer() {}
 
@@ -37,6 +53,18 @@ public final class HeaderTextRecognizer {
      */
     public static List<MetadataReader.UiText> recognize(
             Bitmap screen, BoardAnalyzer.Region board) throws Exception {
+        return recognize(screen, board, TimeUnit.SECONDS.toMillis(SCAN_TIMEOUT_SECONDS));
+    }
+
+    static List<MetadataReader.UiText> recognize(
+            Bitmap screen, BoardAnalyzer.Region board, long timeoutMs) throws Exception {
+        synchronized (RECOGNITION_LOCK) {
+            return recognizeLocked(screen, board, timeoutMs);
+        }
+    }
+
+    private static List<MetadataReader.UiText> recognizeLocked(
+            Bitmap screen, BoardAnalyzer.Region board, long timeoutMs) throws Exception {
         int width = screen.getWidth();
         int top = board.top();
         int playerTop = Math.max(0, top - Math.round(width * .155f));
@@ -54,30 +82,46 @@ public final class HeaderTextRecognizer {
 
         Map<String, MetadataReader.UiText> found = new LinkedHashMap<>();
         Map<String, NameCandidate> names = new LinkedHashMap<>();
-        TextRecognizer japanese = TextRecognition.getClient(
-                new JapaneseTextRecognizerOptions.Builder().build());
-        try {
-            for (Crop crop : passes) {
-                recognizePass(screen, crop, japanese, NameScriptSelector.OcrModel.JAPANESE,
-                        found, names);
-            }
-        } finally {
-            japanese.close();
+        ArrayList<OcrRequest> japaneseRequests = new ArrayList<>(passes.size());
+        ArrayList<OcrRequest> chineseRequests = new ArrayList<>(2);
+        long deadlineNanos = deadlineAfterMillis(timeoutMs);
+
+        TextRecognizer japanese = getJapaneseRecognizer();
+        for (Crop crop : passes) {
+            japaneseRequests.add(startPass(screen, crop, japanese,
+                    NameScriptSelector.OcrModel.JAPANESE));
         }
 
-        TextRecognizer chinese = null;
         try {
-            chinese = TextRecognition.getClient(
-                    new ChineseTextRecognizerOptions.Builder().build());
+            TextRecognizer chinese = getChineseRecognizer();
             for (Crop crop : passes) {
                 if (crop.side == PlayerSide.NONE) continue;
-                recognizePass(screen, crop, chinese, NameScriptSelector.OcrModel.CHINESE,
-                        found, names);
+                chineseRequests.add(startPass(screen, crop, chinese,
+                        NameScriptSelector.OcrModel.CHINESE));
             }
         } catch (Throwable ignored) {
             // The Japanese/Latin pass remains a complete fallback.
-        } finally {
-            if (chinese != null) chinese.close();
+        }
+
+        ArrayList<OcrRequest> allRequests = new ArrayList<>(
+                japaneseRequests.size() + chineseRequests.size());
+        allRequests.addAll(japaneseRequests);
+        allRequests.addAll(chineseRequests);
+        awaitUntilDeadline(allRequests, deadlineNanos);
+
+        // Japanese is the required baseline. Chinese augments player names only and must
+        // never prevent a scan from succeeding.
+        for (OcrRequest request : japaneseRequests) {
+            request.requireSuccess();
+            collectResult(request, found, names);
+        }
+        for (OcrRequest request : chineseRequests) {
+            if (!request.isSuccessful()) continue;
+            try {
+                collectResult(request, found, names);
+            } catch (Throwable ignored) {
+                // Preserve the complete Japanese/Latin fallback on optional parse failures.
+            }
         }
 
         // Remove the raw name rows from the full Japanese pass and add only the selected
@@ -88,62 +132,117 @@ public final class HeaderTextRecognizer {
         return List.copyOf(found.values());
     }
 
-    private static void recognizePass(Bitmap screen, Crop crop, TextRecognizer recognizer,
-                                      NameScriptSelector.OcrModel model,
-                                      Map<String, MetadataReader.UiText> found,
-                                      Map<String, NameCandidate> names) throws Exception {
-        if (crop.right <= crop.left || crop.bottom <= crop.top) return;
-        Bitmap source = Bitmap.createBitmap(screen, crop.left, crop.top,
-                crop.right - crop.left, crop.bottom - crop.top);
-        Bitmap scaled = source;
-        if (crop.scale > 1) {
-            scaled = Bitmap.createScaledBitmap(source,
-                    source.getWidth() * crop.scale, source.getHeight() * crop.scale, true);
+    private static long deadlineAfterMillis(long timeoutMs) {
+        long now = System.nanoTime();
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0, timeoutMs));
+        long deadline = now + timeoutNanos;
+        return timeoutNanos > 0 && deadline < now ? Long.MAX_VALUE : deadline;
+    }
+
+    /** Releases the cached clients when the owning accessibility service is destroyed. */
+    static void close() {
+        synchronized (RECOGNITION_LOCK) {
+            closeRecognizer(japaneseRecognizer);
+            closeRecognizer(chineseRecognizer);
+            japaneseRecognizer = null;
+            chineseRecognizer = null;
+        }
+    }
+
+    private static TextRecognizer getJapaneseRecognizer() {
+        if (japaneseRecognizer == null) {
+            japaneseRecognizer = TextRecognition.getClient(
+                    new JapaneseTextRecognizerOptions.Builder().build());
+        }
+        return japaneseRecognizer;
+    }
+
+    private static TextRecognizer getChineseRecognizer() {
+        if (chineseRecognizer == null) {
+            chineseRecognizer = TextRecognition.getClient(
+                    new ChineseTextRecognizerOptions.Builder().build());
+        }
+        return chineseRecognizer;
+    }
+
+    private static void closeRecognizer(TextRecognizer recognizer) {
+        if (recognizer == null) return;
+        try {
+            recognizer.close();
+        } catch (Throwable ignored) {
+            // Service teardown must not crash because an optional native model is unavailable.
+        }
+    }
+
+    private static OcrRequest startPass(Bitmap screen, Crop crop, TextRecognizer recognizer,
+                                        NameScriptSelector.OcrModel model) {
+        OcrRequest request = new OcrRequest(crop, model);
+        if (crop.right <= crop.left || crop.bottom <= crop.top) {
+            request.completeWithoutTask(null);
+            return request;
         }
 
-        CountDownLatch latch = new CountDownLatch(1);
-        AtomicReference<Text> result = new AtomicReference<>();
-        AtomicReference<Exception> failure = new AtomicReference<>();
-        boolean completed = false;
         try {
-            recognizer.process(InputImage.fromBitmap(scaled, 0))
-                    .addOnSuccessListener(value -> {
-                        result.set(value);
-                        latch.countDown();
-                    })
-                    .addOnFailureListener(error -> {
-                        failure.set(error);
-                        latch.countDown();
-                    });
-            completed = latch.await(PASS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            if (!completed) throw new IllegalStateException("対局情報OCRが時間内に完了しません");
-            if (failure.get() != null) throw failure.get();
-            Text text = result.get();
-            if (text == null) return;
-            for (Text.TextBlock block : text.getTextBlocks()) {
-                for (Text.Line line : block.getLines()) {
+            request.retain(createPassBitmap(screen, crop));
+            Task<Text> task = recognizer.process(
+                    InputImage.fromBitmap(request.bitmap(), 0));
+            task.addOnCompleteListener(DIRECT_EXECUTOR, request::completeFromTask);
+        } catch (Throwable failure) {
+            request.completeWithoutTask(failure);
+        }
+        return request;
+    }
+
+    private static Bitmap createPassBitmap(Bitmap screen, Crop crop) {
+        Bitmap source = Bitmap.createBitmap(screen, crop.left, crop.top,
+                crop.right - crop.left, crop.bottom - crop.top);
+        if (crop.scale <= 1) return source;
+        try {
+            Bitmap scaled = Bitmap.createScaledBitmap(source,
+                    source.getWidth() * crop.scale, source.getHeight() * crop.scale, true);
+            if (scaled != source) source.recycle();
+            return scaled;
+        } catch (RuntimeException | Error failure) {
+            source.recycle();
+            throw failure;
+        }
+    }
+
+    private static void awaitUntilDeadline(List<OcrRequest> requests, long deadlineNanos)
+            throws InterruptedException {
+        for (OcrRequest request : requests) {
+            if (request.isComplete()) continue;
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) return;
+            request.await(remainingNanos);
+        }
+    }
+
+    private static void collectResult(OcrRequest request,
+                                      Map<String, MetadataReader.UiText> found,
+                                      Map<String, NameCandidate> names) {
+        Text text = request.result();
+        if (text == null) return;
+        Crop crop = request.crop;
+        NameScriptSelector.OcrModel model = request.model;
+        for (Text.TextBlock block : text.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                if (crop.addHeaderText) {
+                    add(found, line.getText(), line.getBoundingBox(), crop);
+                }
+                if (crop.side != PlayerSide.NONE) {
+                    addName(names, line.getText(), line.getBoundingBox(), crop, model,
+                            line.getRecognizedLanguage(), line.getConfidence());
+                }
+                for (Text.Element element : line.getElements()) {
                     if (crop.addHeaderText) {
-                        add(found, line.getText(), line.getBoundingBox(), crop);
+                        add(found, element.getText(), element.getBoundingBox(), crop);
                     }
                     if (crop.side != PlayerSide.NONE) {
-                        addName(names, line.getText(), line.getBoundingBox(), crop, model,
-                                line.getRecognizedLanguage(), line.getConfidence());
-                    }
-                    for (Text.Element element : line.getElements()) {
-                        if (crop.addHeaderText) {
-                            add(found, element.getText(), element.getBoundingBox(), crop);
-                        }
-                        if (crop.side != PlayerSide.NONE) {
-                            addName(names, element.getText(), element.getBoundingBox(), crop, model,
-                                    element.getRecognizedLanguage(), element.getConfidence());
-                        }
+                        addName(names, element.getText(), element.getBoundingBox(), crop, model,
+                                element.getRecognizedLanguage(), element.getConfidence());
                     }
                 }
-            }
-        } finally {
-            if (completed) {
-                if (scaled != source) scaled.recycle();
-                source.recycle();
             }
         }
     }
@@ -265,6 +364,81 @@ public final class HeaderTextRecognizer {
 
     private record Crop(int left, int top, int right, int bottom, int scale,
                         PlayerSide side, boolean addHeaderText) {}
+
+    private static final class OcrRequest {
+        private final Crop crop;
+        private final NameScriptSelector.OcrModel model;
+        private final CountDownLatch completion = new CountDownLatch(1);
+        private final AtomicBoolean completionStarted = new AtomicBoolean();
+        private final AtomicReference<Bitmap> retainedBitmap = new AtomicReference<>();
+        private volatile Text result;
+        private volatile Throwable failure;
+
+        private OcrRequest(Crop crop, NameScriptSelector.OcrModel model) {
+            this.crop = crop;
+            this.model = model;
+        }
+
+        private void retain(Bitmap bitmap) {
+            retainedBitmap.set(bitmap);
+        }
+
+        private Bitmap bitmap() {
+            return retainedBitmap.get();
+        }
+
+        private void completeFromTask(Task<Text> task) {
+            if (task.isSuccessful()) {
+                complete(task.getResult(), null);
+            } else {
+                Throwable taskFailure = task.getException();
+                complete(null, taskFailure != null ? taskFailure
+                        : new IllegalStateException("対局情報OCRが完了しませんでした"));
+            }
+        }
+
+        private void completeWithoutTask(Throwable taskFailure) {
+            complete(null, taskFailure);
+        }
+
+        private void complete(Text taskResult, Throwable taskFailure) {
+            if (!completionStarted.compareAndSet(false, true)) return;
+            result = taskResult;
+            failure = taskFailure;
+            Bitmap bitmap = retainedBitmap.getAndSet(null);
+            try {
+                if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+            } finally {
+                completion.countDown();
+            }
+        }
+
+        private void await(long timeoutNanos) throws InterruptedException {
+            completion.await(timeoutNanos, TimeUnit.NANOSECONDS);
+        }
+
+        private boolean isComplete() {
+            // CountDownLatch publishes result/failure only after bitmap cleanup is finished.
+            return completion.getCount() == 0;
+        }
+
+        private boolean isSuccessful() {
+            return isComplete() && failure == null;
+        }
+
+        private Text result() {
+            return result;
+        }
+
+        private void requireSuccess() throws Exception {
+            if (!isComplete()) {
+                throw new RecognitionTimeoutException();
+            }
+            if (failure == null) return;
+            if (failure instanceof Exception exception) throw exception;
+            throw new IllegalStateException("対局情報OCRに失敗しました", failure);
+        }
+    }
 
     private record NameCandidate(String text, Rect bounds,
                                  NameScriptSelector.OcrModel model,
