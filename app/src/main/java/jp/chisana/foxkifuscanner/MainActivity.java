@@ -1,6 +1,7 @@
 package jp.chisana.foxkifuscanner;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.*;
 import android.media.projection.MediaProjectionManager;
@@ -23,6 +24,7 @@ public final class MainActivity extends Activity {
         }
     };
 
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         setContentView(buildUi());

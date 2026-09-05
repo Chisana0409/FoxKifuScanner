@@ -89,6 +89,13 @@ grep -Fq "Class descriptor  : 'Ljp/chisana/foxkifuscanner/ScanMetrics;'" \
   echo "scan metrics class is missing from APK" >&2
   exit 1
 }
+for class_name in ShsFramePixels SliderIndexRange SliderIndexTextParser SliderSeekPlan SliderStepValidator; do
+  grep -Fq "Class descriptor  : 'Ljp/chisana/foxkifuscanner/${class_name};'" \
+    "$work/dump.txt" || {
+    echo "SHS class ${class_name} is missing from APK" >&2
+    exit 1
+  }
+done
 
 count=$(grep -Fc "Class descriptor  : 'Ljp/chisana/foxkifuscanner/MetadataReader;'" "$work/dump.txt")
 [[ "$count" -eq 1 ]] || {

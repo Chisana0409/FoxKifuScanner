@@ -5,6 +5,7 @@
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
     android:notificationTimeout="50"
     android:canPerformGestures="true"
+    android:canTakeScreenshot="true"
     android:canRetrieveWindowContent="true"
     android:description="@string/accessibility_description"
     android:settingsActivity="jp.chisana.foxkifuscanner.MainActivity" />

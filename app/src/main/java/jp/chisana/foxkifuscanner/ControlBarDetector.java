@@ -60,11 +60,11 @@ public final class ControlBarDetector {
     public static Thumb detectThumb(BoardAnalyzer.Pixels pixels, int controlY) {
         int width = pixels.width();
         int height = pixels.height();
-        int x0 = (int) Math.round(width * 0.02);
-        int x1 = (int) Math.round(width * 0.50);
-        int radius = Math.max(12, (int) Math.round(height * 0.020));
-        int y0 = Math.max(0, controlY - radius);
-        int y1 = Math.min(height - 1, controlY + radius);
+        BoardAnalyzer.Region sample = thumbSampleRegion(width, height, controlY);
+        int x0 = sample.left();
+        int x1 = sample.right() - 1;
+        int y0 = sample.top();
+        int y1 = sample.bottom() - 1;
         int[] scores = new int[x1 - x0 + 1];
         int best = 0;
         for (int x = x0; x <= x1; x++) {
@@ -88,6 +88,19 @@ public final class ControlBarDetector {
         }
         if (right < left) return new Thumb(-1, best);
         return new Thumb((left + right) / 2, best);
+    }
+
+    /** Exact, inclusive-source sampling strip used by {@link #detectThumb}. */
+    static BoardAnalyzer.Region thumbSampleRegion(int width, int height, int controlY) {
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("screen dimensions must be positive");
+        }
+        int x0 = (int) Math.round(width * 0.02);
+        int x1 = (int) Math.round(width * 0.50);
+        int radius = Math.max(12, (int) Math.round(height * 0.020));
+        int y0 = Math.max(0, controlY - radius);
+        int y1 = Math.min(height - 1, controlY + radius);
+        return new BoardAnalyzer.Region(x0, y0, x1 + 1, y1 + 1);
     }
 
     private static boolean isReplayBlue(int color) {
