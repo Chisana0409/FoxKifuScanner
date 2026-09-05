@@ -27,6 +27,10 @@ final class ScanMetrics {
     private int ocrTimeouts;
     private int sliderMoves;
     private int sliderFallbacks;
+    private int sliderEventAcks;
+    private int sliderSnapshotAcks;
+    private int sliderUnchangedFrames;
+    private int sliderPassProbes;
     private String sliderMode = "none";
     private long ocrStartedNanos;
     private boolean ocrPhaseRecorded;
@@ -70,6 +74,10 @@ final class ScanMetrics {
         // A failed RANGE attempt can be rewound and retried via TEXT. Report only the
         // accepted moves of the currently selected SHS route, not discarded probe moves.
         sliderMoves = 0;
+        sliderEventAcks = 0;
+        sliderSnapshotAcks = 0;
+        sliderUnchangedFrames = 0;
+        sliderPassProbes = 0;
     }
 
     synchronized void acceptedSliderMove() {
@@ -78,6 +86,22 @@ final class ScanMetrics {
 
     synchronized void sliderFallback() {
         sliderFallbacks++;
+    }
+
+    synchronized void sliderEventAck() {
+        sliderEventAcks++;
+    }
+
+    synchronized void sliderSnapshotAck() {
+        sliderSnapshotAcks++;
+    }
+
+    synchronized void sliderUnchangedFrame() {
+        sliderUnchangedFrames++;
+    }
+
+    synchronized void sliderPassProbe() {
+        sliderPassProbes++;
     }
 
     synchronized void acceptedFastMove() {
@@ -150,6 +174,10 @@ final class ScanMetrics {
                 .append(" sliderMode=").append(sliderMode)
                 .append(" sliderMoves=").append(sliderMoves)
                 .append(" sliderFallbacks=").append(sliderFallbacks)
+                .append(" sliderEventAcks=").append(sliderEventAcks)
+                .append(" sliderSnapshotAcks=").append(sliderSnapshotAcks)
+                .append(" sliderUnchanged=").append(sliderUnchangedFrames)
+                .append(" sliderPassProbes=").append(sliderPassProbes)
                 .append(" retries=").append(retries)
                 .append(" ocrTimeouts=").append(ocrTimeouts)
                 .append(" freshFrames=").append(freshFrames)

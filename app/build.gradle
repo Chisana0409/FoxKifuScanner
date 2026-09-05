@@ -9,8 +9,8 @@ android {
         applicationId 'jp.chisana.foxkifuscanner'
         minSdk 30
         targetSdk 35
-        versionCode 10301
-        versionName '1.3.1-shs'
+        versionCode 10302
+        versionName '1.3.2-shs20'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 

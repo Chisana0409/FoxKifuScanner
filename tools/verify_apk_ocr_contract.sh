@@ -89,7 +89,7 @@ grep -Fq "Class descriptor  : 'Ljp/chisana/foxkifuscanner/ScanMetrics;'" \
   echo "scan metrics class is missing from APK" >&2
   exit 1
 }
-for class_name in ShsFramePixels SliderIndexRange SliderIndexTextParser SliderSeekPlan SliderStepValidator; do
+for class_name in ShsFramePixels SliderIndexRange SliderIndexTextParser SliderSeekPlan SliderStepValidator SliderPassGate; do
   grep -Fq "Class descriptor  : 'Ljp/chisana/foxkifuscanner/${class_name};'" \
     "$work/dump.txt" || {
     echo "SHS class ${class_name} is missing from APK" >&2
