@@ -2,6 +2,7 @@ package jp.chisana.foxkifuscanner;
 
 import android.graphics.Bitmap;
 import android.graphics.PointF;
+import android.graphics.Rect;
 
 public final class ScreenGeometry {
     public final BoardAnalyzer.Region board;
@@ -44,8 +45,12 @@ public final class ScreenGeometry {
     }
 
     public PointF sliderThumb(Bitmap bitmap) {
+        return sliderThumb(new BitmapPixels(bitmap));
+    }
+
+    public PointF sliderThumb(BoardAnalyzer.Pixels pixels) {
         ControlBarDetector.Thumb thumb = ControlBarDetector.detectThumb(
-                new BitmapPixels(bitmap), Math.round(sliderLeft.y));
+                pixels, Math.round(sliderLeft.y));
         if (thumb.centerX() < 0) {
             throw new IllegalStateException("手数操作バーのツマミ位置を検出できません");
         }
@@ -68,5 +73,41 @@ public final class ScreenGeometry {
         double progress = (thumb.centerX() - sliderLeft.x)
                 / Math.max(1.0, sliderRight.x - sliderLeft.x);
         return Math.max(0, Math.min(1, progress));
+    }
+
+    /** Returns a safe point on the replay slider for a normalized position. */
+    public PointF sliderPoint(double progress) {
+        if (!Double.isFinite(progress) || progress < 0.0 || progress > 1.0) {
+            throw new IllegalArgumentException("手数バーの位置が範囲外です");
+        }
+        PointF point = new PointF((float) (sliderLeft.x
+                + (sliderRight.x - sliderLeft.x) * progress), sliderLeft.y);
+        requireSafe(point);
+        return point;
+    }
+
+    public float sliderTrackWidth() {
+        return Math.max(1f, sliderRight.x - sliderLeft.x);
+    }
+
+    public double sliderProgressForX(float x) {
+        double progress = (x - sliderLeft.x) / sliderTrackWidth();
+        return Math.max(0.0, Math.min(1.0, progress));
+    }
+
+    /** Ensures an accessibility range really belongs to the protected replay strip. */
+    public boolean isSliderControlBounds(Rect bounds) {
+        if (!isReplayControlRow(bounds)) return false;
+        int xTolerance = Math.max(12, Math.round(screenWidth * 0.025f));
+        return bounds.right >= sliderLeft.x - xTolerance
+                && bounds.left <= sliderRight.x + xTolerance;
+    }
+
+    /** True for text or controls on the already validated replay-control row. */
+    public boolean isReplayControlRow(Rect bounds) {
+        if (bounds == null || bounds.isEmpty()) return false;
+        int yTolerance = Math.max(20, Math.round(screenWidth * 0.035f));
+        return bounds.centerY() >= safeTop && bounds.centerY() <= safeBottom
+                && Math.abs(bounds.centerY() - sliderLeft.y) <= yTolerance;
     }
 }

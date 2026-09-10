@@ -12,8 +12,10 @@ import java.util.regex.Pattern;
 public final class MetadataReader {
     private static final Pattern RANK = Pattern.compile(
             "([0-9０-９一二三四五六七八九十IOIlｌ｜丨]+[級段])");
-    private static final Pattern NUMBER_RESULT = Pattern.compile(
-            "(黒|白).*?([0-9]+(?:\\.[0-9]+)?)(?:と?([0-9]+)/([0-9]+))?(子|目)");
+    private static final Pattern RESULT_FRACTION = Pattern.compile(
+            "(?:([0-9]+(?:\\.[0-9]+)?)と)?([0-9]+)/(\\d+)(子|目)");
+    private static final Pattern RESULT_INTEGER = Pattern.compile(
+            "([0-9]+(?:\\.[0-9]+)?)(子|目)");
     private static final Pattern NAME_TOKEN = Pattern.compile("[\\p{L}\\p{N}_.-]{1,32}");
     private static final String REJECTED_NAME_WORDS =
             "昇降級戦|互先|定先|先手|譲る|中盤|投了|時間切れ|不戦|勝ち|黒番|白番|"
@@ -221,6 +223,8 @@ public final class MetadataReader {
                 .replace('／', '/').replace("¼", "1/4").replace("½", "1/2")
                 .replace("¾", "3/4");
         if (text.contains("持碁") || text.contains("引き分け")) return "0";
+        String winner = winner(text);
+        if (winner.isBlank()) return "";
 
         Matcher resigned = Pattern.compile("(黒|白).*?(?:中盤|投了).*?勝").matcher(text);
         if (resigned.find()) return winner(resigned.group(1)) + "+R";
@@ -237,15 +241,31 @@ public final class MetadataReader {
             return winner(half.group(1)) + "+" + formatAmount(amount);
         }
 
-        Matcher numeric = NUMBER_RESULT.matcher(text);
-        if (!numeric.find()) return "";
-        double amount = Double.parseDouble(numeric.group(2));
-        if (numeric.group(3) != null) {
-            amount += Double.parseDouble(numeric.group(3))
-                    / Double.parseDouble(numeric.group(4));
+        Double amount = parseResultAmount(text);
+        if (amount == null) return "";
+        return winner + "+" + formatAmount(amount);
+    }
+
+    private static Double parseResultAmount(String source) {
+        String text = trimWinnerPrefix(source);
+
+        Matcher fraction = RESULT_FRACTION.matcher(text);
+        if (fraction.find()) {
+            double amount = 0;
+            if (fraction.group(1) != null) {
+                amount += Double.parseDouble(fraction.group(1));
+            }
+            amount += Double.parseDouble(fraction.group(2))
+                    / Double.parseDouble(fraction.group(3));
+            if ("子".equals(fraction.group(4))) amount *= 2.0;
+            return amount;
         }
-        if (numeric.group(5).equals("子")) amount *= 2.0;
-        return winner(numeric.group(1)) + "+" + formatAmount(amount);
+
+        Matcher integer = RESULT_INTEGER.matcher(text);
+        if (!integer.find()) return null;
+        double amount = Double.parseDouble(integer.group(1));
+        if ("子".equals(integer.group(2))) amount *= 2.0;
+        return amount;
     }
 
     private static String winner(String value) {
@@ -256,6 +276,14 @@ public final class MetadataReader {
         if (amount == Math.rint(amount)) return Long.toString(Math.round(amount));
         return String.format(Locale.ROOT, "%.3f", amount).replaceAll("0+$", "")
                 .replaceAll("\\.$", "");
+    }
+
+    private static String trimWinnerPrefix(String source) {
+        int black = source.indexOf("黒");
+        if (black >= 0) return source.substring(black + 1);
+        int white = source.indexOf("白");
+        if (white >= 0) return source.substring(white + 1);
+        return source;
     }
 
     private static double indicatorDarkness(Bitmap bitmap, int cx, int cy, int radius) {

@@ -18,12 +18,20 @@ final class ScanMetrics {
     private long freshFrameWaitNanos;
     private long lightAnalysisNanos;
     private long boardAnalysisNanos;
+    private long sliderSeekNanos;
     private int freshFrames;
     private int freshTimeouts;
     private int fastOneFrameMoves;
     private int verifiedMoves;
     private int retries;
     private int ocrTimeouts;
+    private int sliderMoves;
+    private int sliderFallbacks;
+    private int sliderEventAcks;
+    private int sliderSnapshotAcks;
+    private int sliderUnchangedFrames;
+    private int sliderPassProbes;
+    private String sliderMode = "none";
     private long ocrStartedNanos;
     private boolean ocrPhaseRecorded;
     private boolean ocrTimeoutRecorded;
@@ -55,6 +63,45 @@ final class ScanMetrics {
 
     synchronized void addLightAnalysis(long sinceNanos) {
         lightAnalysisNanos += Math.max(0, SystemClock.elapsedRealtimeNanos() - sinceNanos);
+    }
+
+    synchronized void addSliderSeek(long sinceNanos) {
+        sliderSeekNanos += Math.max(0, SystemClock.elapsedRealtimeNanos() - sinceNanos);
+    }
+
+    synchronized void sliderStarted(String mode) {
+        sliderMode = mode == null || mode.isBlank() ? "unknown" : mode;
+        // A failed RANGE attempt can be rewound and retried via TEXT. Report only the
+        // accepted moves of the currently selected SHS route, not discarded probe moves.
+        sliderMoves = 0;
+        sliderEventAcks = 0;
+        sliderSnapshotAcks = 0;
+        sliderUnchangedFrames = 0;
+        sliderPassProbes = 0;
+    }
+
+    synchronized void acceptedSliderMove() {
+        sliderMoves++;
+    }
+
+    synchronized void sliderFallback() {
+        sliderFallbacks++;
+    }
+
+    synchronized void sliderEventAck() {
+        sliderEventAcks++;
+    }
+
+    synchronized void sliderSnapshotAck() {
+        sliderSnapshotAcks++;
+    }
+
+    synchronized void sliderUnchangedFrame() {
+        sliderUnchangedFrames++;
+    }
+
+    synchronized void sliderPassProbe() {
+        sliderPassProbes++;
     }
 
     synchronized void acceptedFastMove() {
@@ -124,6 +171,13 @@ final class ScanMetrics {
                 .append(" moves=").append(moves)
                 .append(" fast1Frame=").append(fastOneFrameMoves)
                 .append(" verified=").append(verifiedMoves)
+                .append(" sliderMode=").append(sliderMode)
+                .append(" sliderMoves=").append(sliderMoves)
+                .append(" sliderFallbacks=").append(sliderFallbacks)
+                .append(" sliderEventAcks=").append(sliderEventAcks)
+                .append(" sliderSnapshotAcks=").append(sliderSnapshotAcks)
+                .append(" sliderUnchanged=").append(sliderUnchangedFrames)
+                .append(" sliderPassProbes=").append(sliderPassProbes)
                 .append(" retries=").append(retries)
                 .append(" ocrTimeouts=").append(ocrTimeouts)
                 .append(" freshFrames=").append(freshFrames)
@@ -131,7 +185,8 @@ final class ScanMetrics {
                 .append(" gestureMs=").append(format(millis(gestureNanos)))
                 .append(" freshAcquireMs=").append(format(millis(freshFrameWaitNanos)))
                 .append(" lightAnalysisMs=").append(format(millis(lightAnalysisNanos)))
-                .append(" boardAnalysisMs=").append(format(millis(boardAnalysisNanos)));
+                .append(" boardAnalysisMs=").append(format(millis(boardAnalysisNanos)))
+                .append(" sliderSeekMs=").append(format(millis(sliderSeekNanos)));
         for (Map.Entry<String, Long> phase : phaseNanos.entrySet()) {
             out.append(' ').append(phase.getKey()).append("Ms=")
                     .append(format(millis(phase.getValue())));

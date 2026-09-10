@@ -7,6 +7,7 @@ import android.graphics.Path;
 import android.graphics.PointF;
 import android.graphics.Rect;
 import android.hardware.HardwareBuffer;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -32,6 +33,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class ReaderAccessibilityService extends AccessibilityService {
@@ -43,11 +45,29 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     private static final long TAP_DURATION_MS = 20;
     private static final long PROGRESS_UPDATE_INTERVAL_MS = 150;
     private static final double FAST_FRAME_MIN_CONFIDENCE = 0.78;
+    private static final long SHS_INDEX_ACK_TIMEOUT_MS = 180;
+    private static final long SHS_STEP_TIMEOUT_MS = 2200;
+    private static final long SHS_ACK_POLL_MS = 4;
+    private static final long SHS_PASS_SCREENSHOT_TIMEOUT_MS = 500;
+    private static final long SHS_PASS_PROBE_INTERVAL_MS = 350;
+    private static final long SHS_SEEK_DURATION_MS = 16;
+    private static final int SHS_NODE_LIMIT = 1200;
+    private static final double SHS_MIN_CONFIDENCE = 0.78;
+    private static final float SHS_TEXT_MIN_PIXELS_PER_MOVE = 1.20f;
+    private static final double SHS_THUMB_UNCERTAINTY_PIXELS = 2.5;
+    private static final double SHS_MIN_VISUAL_PROGRESS_TOLERANCE = 0.008;
     private static volatile ReaderAccessibilityService instance;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ExecutorService ocrWorker = Executors.newSingleThreadExecutor();
+    private final ShsFramePixels shsFramePixels = new ShsFramePixels();
+    private final AtomicReference<SliderSession> activeSliderSession = new AtomicReference<>();
+    private final AtomicReference<CachedRangeSliderEvent> latestRangeSliderEvent =
+            new AtomicReference<>();
+    private final AtomicReference<CachedTextSliderEvent> latestTextSliderEvent =
+            new AtomicReference<>();
+    private final AtomicReference<SliderKey> pendingRangeSliderKey = new AtomicReference<>();
     private volatile boolean cancelled;
     private volatile boolean running;
     private volatile long terminalSignalUntil;
@@ -78,6 +98,124 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     private record Outcome(OutcomeType type, Move move, BoardState after,
                            BoardFrameFingerprint fingerprint, double sliderProgress,
                            String message) {}
+
+    private enum SliderMode { RANGE, TEXT }
+
+    private record SliderKey(String packageName, String viewId, String className, Rect bounds) {}
+
+    private record SliderRangeSnapshot(SliderKey key, SliderIndexRange range,
+                                       SliderSeekPlan.Snapshot raw) {}
+
+    private record SliderNodeCandidate(AccessibilityNodeInfo node,
+                                       SliderRangeSnapshot snapshot) {}
+
+    private record SliderAction(long frameSequence, long startedUptimeMillis) {}
+
+    private record SliderAcknowledgement(SliderSeekPlan.Snapshot snapshot,
+                                         long eventUptimeMillis,
+                                         long receivedUptimeMillis,
+                                         long frameSequence,
+                                         boolean eventDriven) {}
+
+    /** Immutable source identity attached to a lightweight slider accessibility event. */
+    private record SliderEventSource(String packageName, String className, String viewId,
+                                     int left, int top, int right, int bottom) {
+        SliderKey sliderKey() {
+            return new SliderKey(packageName, viewId, className,
+                    new Rect(left, top, right, bottom));
+        }
+    }
+
+    private record SliderEventStamp(SliderEventSource source, long eventUptimeMillis,
+                                    long receivedUptimeMillis, long captureSequence) {}
+
+    private record CachedRangeSliderEvent(SliderEventStamp stamp, SliderIndexRange range,
+                                          SliderSeekPlan.Snapshot raw) {}
+
+    private record CachedTextSliderEvent(SliderEventStamp stamp,
+                                         SliderIndexTextParser.Snapshot index) {}
+
+    private static final class SliderSession implements AutoCloseable {
+        private final SliderMode mode;
+        private final SliderKey key;
+        private final SliderSeekPlan plan;
+        private final int totalMoves;
+        private final ScreenGeometry geometry;
+        private AccessibilityNodeInfo cachedRangeNode;
+        private boolean closed;
+
+        SliderSession(SliderMode mode, SliderKey key, SliderSeekPlan plan,
+                      int totalMoves, ScreenGeometry geometry,
+                      AccessibilityNodeInfo cachedRangeNode) {
+            this.mode = mode;
+            this.key = key;
+            this.plan = plan;
+            this.totalMoves = totalMoves;
+            this.geometry = geometry;
+            this.cachedRangeNode = cachedRangeNode;
+        }
+
+        SliderMode mode() { return mode; }
+
+        SliderKey key() { return key; }
+
+        SliderSeekPlan plan() { return plan; }
+
+        int totalMoves() { return totalMoves; }
+
+        ScreenGeometry geometry() { return geometry; }
+
+        String metricName() { return mode == SliderMode.RANGE ? "range" : "text"; }
+
+        synchronized AccessibilityNodeInfo cachedRangeNode() {
+            return closed ? null : cachedRangeNode;
+        }
+
+        synchronized boolean replaceCachedRangeNode(AccessibilityNodeInfo replacement) {
+            if (closed) return false;
+            if (cachedRangeNode == replacement) return true;
+            AccessibilityNodeInfo previous = cachedRangeNode;
+            cachedRangeNode = replacement;
+            recycleNode(previous);
+            return true;
+        }
+
+        synchronized void discardCachedRangeNode(AccessibilityNodeInfo expected) {
+            if (cachedRangeNode != expected) return;
+            cachedRangeNode = null;
+            recycleNode(expected);
+        }
+
+        @Override public synchronized void close() {
+            if (closed) return;
+            closed = true;
+            AccessibilityNodeInfo previous = cachedRangeNode;
+            cachedRangeNode = null;
+            recycleNode(previous);
+        }
+
+        private static void recycleNode(AccessibilityNodeInfo node) {
+            if (node == null) return;
+            try {
+                node.recycle();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private record SliderStep(Move move, BoardState state, PointF thumb) {}
+
+    private record SliderReplayResult(List<Move> moves, String fallbackReason) {
+        static SliderReplayResult success(List<Move> moves) {
+            return new SliderReplayResult(List.copyOf(moves), null);
+        }
+
+        static SliderReplayResult fallback(String reason) {
+            return new SliderReplayResult(List.of(), reason);
+        }
+
+        boolean succeeded() { return fallbackReason == null; }
+    }
 
     @Override protected void onServiceConnected() {
         super.onServiceConnected();
@@ -114,6 +252,106 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         if (isTerminalText(text.toString())) {
             terminalSignalUntil = SystemClock.uptimeMillis() + 6000;
         }
+        if (!running) return;
+
+        long eventUptimeMillis = event.getEventTime();
+        long receivedUptimeMillis = SystemClock.uptimeMillis();
+        long captureSequence = CaptureService.currentSequence();
+        AccessibilityNodeInfo source = null;
+        try {
+            source = event.getSource();
+            if (source == null || !source.isVisibleToUser()) return;
+
+            CharSequence packageValue = source.getPackageName();
+            String packageName = packageValue == null ? "" : packageValue.toString();
+            if (packageName.isBlank() || getPackageName().equals(packageName)) return;
+
+            Rect bounds = new Rect();
+            source.getBoundsInScreen(bounds);
+            if (bounds.isEmpty()) return;
+            CharSequence classValue = source.getClassName();
+            String className = classValue == null ? "" : classValue.toString();
+            String viewId = source.getViewIdResourceName();
+            SliderEventSource eventSource = new SliderEventSource(
+                    packageName, className, viewId == null ? "" : viewId,
+                    bounds.left, bounds.top, bounds.right, bounds.bottom);
+            SliderEventStamp stamp = new SliderEventStamp(
+                    eventSource, eventUptimeMillis, receivedUptimeMillis, captureSequence);
+
+            cacheDiscreteRangeEvent(source, stamp);
+            SliderIndexTextParser.Snapshot index = parseSliderIndexEventText(event, source);
+            if (index != null && index.total() > 0) {
+                SliderSession active = activeSliderSession.get();
+                if (active == null || (active.mode() == SliderMode.TEXT
+                        && index.total() == active.totalMoves()
+                        && active.geometry().isReplayControlRow(bounds))) {
+                    latestTextSliderEvent.set(new CachedTextSliderEvent(stamp, index));
+                }
+            }
+        } catch (Throwable ignored) {
+            // Accessibility implementations may invalidate an event source while it is read.
+        } finally {
+            if (source != null) {
+                try {
+                    source.recycle();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private void cacheDiscreteRangeEvent(AccessibilityNodeInfo source, SliderEventStamp stamp) {
+        if (!source.isEnabled() || !supportsSetProgress(source)) return;
+        AccessibilityNodeInfo.RangeInfo info = source.getRangeInfo();
+        if (info == null
+                || info.getType() != AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INT) return;
+        try {
+            SliderIndexRange range = SliderIndexRange.from(
+                    info.getMin(), info.getMax(), info.getCurrent(), true);
+            if (range.moveCount() <= 0) return;
+            SliderSeekPlan.Snapshot raw = new SliderSeekPlan.Snapshot(
+                    info.getMin(), info.getMax(), info.getCurrent());
+            SliderSession active = activeSliderSession.get();
+            if (active != null && (active.mode() != SliderMode.RANGE
+                    || !matchesSliderKey(active.key(), stamp.source().sliderKey()))) return;
+            SliderKey pendingKey = pendingRangeSliderKey.get();
+            if (active == null && pendingKey != null
+                    && !matchesSliderKey(pendingKey, stamp.source().sliderKey())) return;
+            latestRangeSliderEvent.set(new CachedRangeSliderEvent(stamp, range, raw));
+        } catch (IllegalArgumentException ignored) {
+            // Continuous, malformed and out-of-bounds ranges are never cached as move indexes.
+        }
+    }
+
+    private static SliderIndexTextParser.Snapshot parseSliderIndexEventText(
+            AccessibilityEvent event, AccessibilityNodeInfo source) {
+        ArrayList<SliderIndexTextParser.Snapshot> parsed = new ArrayList<>();
+        for (CharSequence item : event.getText()) addSliderIndexText(parsed, item);
+        addSliderIndexText(parsed, event.getContentDescription());
+        addSliderIndexText(parsed, source.getText());
+        addSliderIndexText(parsed, source.getContentDescription());
+        if (parsed.isEmpty()) return null;
+        SliderIndexTextParser.Snapshot first = parsed.get(0);
+        for (int index = 1; index < parsed.size(); index++) {
+            if (!first.equals(parsed.get(index))) return null;
+        }
+        return first;
+    }
+
+    private static void addSliderIndexText(List<SliderIndexTextParser.Snapshot> out,
+                                           CharSequence value) {
+        if (value == null) return;
+        SliderIndexTextParser.Snapshot parsed = SliderIndexTextParser.parse(value.toString());
+        if (parsed != null) out.add(parsed);
+    }
+
+    /** Atomic reads used by the worker once the event-driven replay path is connected. */
+    private CachedRangeSliderEvent latestRangeSliderEvent() {
+        return latestRangeSliderEvent.get();
+    }
+
+    private CachedTextSliderEvent latestTextSliderEvent() {
+        return latestTextSliderEvent.get();
     }
 
     @Override public void onInterrupt() {
@@ -230,6 +468,9 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         cancelled = false;
         running = true;
         terminalSignalUntil = 0;
+        latestRangeSliderEvent.set(null);
+        latestTextSliderEvent.set(null);
+        pendingRangeSliderKey.set(null);
         ScanMetrics metrics = new ScanMetrics();
         activeMoveCount = 0;
         worker.execute(() -> {
@@ -287,15 +528,41 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         Frame initial = rewindToInitial(geometry, meta);
         metrics.addPhase("rewind", rewindStarted);
         BoardState current = initial.detection().state();
-        BoardFrameFingerprint fingerprint = BoardFrameFingerprint.capture(
-                new BitmapPixels(initial.bitmap()), geometry.board);
         meta.initialPosition = current;
-        double progress = initial.sliderProgress();
         initial.recycle();
 
-        List<Move> moves = new ArrayList<>();
         byte expected = meta.handicap > 1 ? BoardState.WHITE : BoardState.BLACK;
         long replayStarted = metrics.mark();
+        SliderReplayResult sliderReplay = trySliderReplay(
+                geometry, current, expected, meta, metrics);
+        if (sliderReplay.succeeded()) {
+            List<Move> moves = new ArrayList<>(sliderReplay.moves());
+            activeMoveCount = moves.size();
+            metrics.addPhase("replay", replayStarted);
+            checkCancelled();
+            meta = resolveMetadata(meta, enhancedMetadata, metrics);
+            checkCancelled();
+            saveCompletedGame(meta, moves, metrics);
+            return;
+        }
+
+        metrics.sliderFallback();
+        publish("スライダー高速読取を利用できないため、安全読取へ戻します："
+                + sliderReplay.fallbackReason());
+        activeMoveCount = 0;
+        Frame fallbackInitial = rewindToInitial(geometry, meta);
+        current = fallbackInitial.detection().state();
+        if (!current.equals(meta.initialPosition)) {
+            fallbackInitial.recycle();
+            throw new IllegalStateException("高速読取後に初期局面へ安全に復帰できません");
+        }
+        BoardFrameFingerprint fingerprint = BoardFrameFingerprint.capture(
+                new BitmapPixels(fallbackInitial.bitmap()), geometry.board);
+        double progress = fallbackInitial.sliderProgress();
+        fallbackInitial.recycle();
+
+        List<Move> moves = new ArrayList<>();
+        expected = meta.handicap > 1 ? BoardState.WHITE : BoardState.BLACK;
         long lastProgressUpdate = 0L;
         for (int turn = 1; turn <= MAX_MOVES; turn++) {
             checkCancelled();
@@ -476,6 +743,842 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Experimental super-high-speed path. It only runs when the replay control exposes an
+     * exact current/total index. Visual thumb progress alone is never treated as a move number.
+     */
+    private SliderReplayResult trySliderReplay(ScreenGeometry geometry, BoardState initial,
+                                               byte firstColor, GameMetadata meta,
+                                               ScanMetrics metrics) throws Exception {
+        try {
+            SliderIndexTextParser.Snapshot initialText = readSliderTextIndex(geometry);
+            boolean canTryText = isInitialTextIndex(initialText);
+            SliderRangeSnapshot range = findReplayRangeSliderOnMain(geometry, null);
+            if (range != null && range.range().currentIndex() == 0
+                    && range.range().moveCount() > 0) {
+                metrics.sliderStarted("range");
+                SliderReplayResult rangeResult;
+                try {
+                    rangeResult = replayRangeSlider(
+                            geometry, range, initial, firstColor, metrics);
+                } catch (CancellationException | InterruptedException error) {
+                    throw error;
+                } catch (Throwable error) {
+                    rangeResult = SliderReplayResult.fallback("離散Range経路の検証に失敗しました（"
+                            + error.getClass().getSimpleName() + "）");
+                }
+                if (rangeResult.succeeded() || !canTryText) return rangeResult;
+
+                Frame rewound = rewindToInitial(geometry, meta);
+                PointF resetThumb;
+                try {
+                    if (!rewound.detection().state().equals(initial)) {
+                        return SliderReplayResult.fallback(rangeResult.fallbackReason()
+                                + "／TEXT経路用の初期局面と一致しません");
+                    }
+                    resetThumb = geometry.sliderThumb(rewound.bitmap());
+                } catch (IllegalStateException missingThumb) {
+                    return SliderReplayResult.fallback(rangeResult.fallbackReason()
+                            + "／TEXT経路用のツマミを確認できません");
+                } finally {
+                    rewound.recycle();
+                }
+
+                SliderIndexTextParser.Snapshot resetText = readSliderTextIndex(geometry);
+                if (!isInitialTextIndex(resetText) || resetText.total() != initialText.total()) {
+                    return SliderReplayResult.fallback(rangeResult.fallbackReason()
+                            + "／TEXT経路用の0手目へ安全に復帰できません");
+                }
+                activeMoveCount = 0;
+                metrics.sliderStarted("range->text");
+                SliderReplayResult textResult = replayTextSlider(
+                        geometry, initial, firstColor, resetText, resetThumb, metrics);
+                if (textResult.succeeded()) return textResult;
+                return SliderReplayResult.fallback(rangeResult.fallbackReason()
+                        + "／TEXT経路: " + textResult.fallbackReason());
+            }
+
+            if (!canTryText) {
+                metrics.sliderStarted("unsupported");
+                return SliderReplayResult.fallback("手数バーの正確な現在手／総手数を取得できません");
+            }
+            PointF thumb = latestSliderThumb(geometry);
+            if (thumb == null) {
+                return SliderReplayResult.fallback("手数バーのツマミを再取得できません");
+            }
+            metrics.sliderStarted("text");
+            return replayTextSlider(
+                    geometry, initial, firstColor, initialText, thumb, metrics);
+        } catch (CancellationException | InterruptedException error) {
+            throw error;
+        } catch (Throwable error) {
+            return SliderReplayResult.fallback("高速経路の検証に失敗しました（"
+                    + error.getClass().getSimpleName() + "）");
+        } finally {
+            shsFramePixels.release();
+        }
+    }
+
+    private static boolean isInitialTextIndex(SliderIndexTextParser.Snapshot text) {
+        return text != null && text.current() == 0 && text.total() > 0;
+    }
+
+    private void activateSliderSession(SliderSession session) {
+        SliderSession previous = activeSliderSession.getAndSet(session);
+        if (previous != null && previous != session) previous.close();
+    }
+
+    private void closeSliderSession(SliderSession session) {
+        activeSliderSession.compareAndSet(session, null);
+        session.close();
+    }
+
+    private void closeActiveSliderSession() {
+        SliderSession session = activeSliderSession.getAndSet(null);
+        if (session != null) session.close();
+    }
+
+    private SliderReplayResult replayTextSlider(ScreenGeometry geometry, BoardState initial,
+                                                byte firstColor,
+                                                SliderIndexTextParser.Snapshot text,
+                                                PointF thumb, ScanMetrics metrics)
+            throws Exception {
+        if (geometry.sliderTrackWidth() / text.total() < SHS_TEXT_MIN_PIXELS_PER_MOVE) {
+            return SliderReplayResult.fallback("画面上の手数バーでは全手を個別指定できません");
+        }
+        SliderSeekPlan plan = SliderSeekPlan.calibrate(
+                new SliderSeekPlan.Snapshot(0, text.total(), 0),
+                new SliderSeekPlan.Snapshot(0, text.total(), 1));
+        SliderSession session = new SliderSession(
+                SliderMode.TEXT, null, plan, plan.totalMoves(), geometry, null);
+        activateSliderSession(session);
+        try {
+            return replaySliderIndexes(geometry, session, 0, initial, firstColor,
+                    new ArrayList<>(), new ArrayList<>(List.of(initial)), thumb, metrics);
+        } finally {
+            closeSliderSession(session);
+        }
+    }
+
+    private SliderReplayResult replayRangeSlider(ScreenGeometry geometry,
+                                                  SliderRangeSnapshot initialRange,
+                                                  BoardState initial,
+                                                  byte firstColor,
+                                                  ScanMetrics metrics) throws Exception {
+        checkCancelled();
+        pendingRangeSliderKey.set(initialRange.key());
+        try {
+            long gestureStarted = metrics.mark();
+            SliderAction firstAction = gestureTap(geometry, geometry.forward);
+            metrics.addGesture(gestureStarted);
+
+            SliderRangeSnapshot afterOne = awaitChangedRangeSlider(
+                    geometry, initialRange, firstAction, SHS_INDEX_ACK_TIMEOUT_MS);
+            if (afterOne == null) {
+                return SliderReplayResult.fallback("一手進めた後の離散インデックスを確認できません");
+            }
+
+            SliderSeekPlan plan;
+            try {
+                plan = SliderSeekPlan.calibrate(initialRange.raw(), afterOne.raw());
+            } catch (IllegalArgumentException invalidRange) {
+                return SliderReplayResult.fallback("手数バーの刻み幅を一手単位に校正できません");
+            }
+            if (plan.totalMoves() < 1 || plan.totalMoves() > MAX_MOVES
+                    || !plan.isAtIndex(afterOne.raw().current(), 1)) {
+                return SliderReplayResult.fallback("手数バーの総手数を安全に確定できません");
+            }
+            AccessibilityNodeInfo cachedRangeNode = obtainRangeSliderNodeOnMain(
+                    geometry, initialRange.key(), plan, 1);
+            SliderSession session = new SliderSession(SliderMode.RANGE,
+                    initialRange.key(), plan, plan.totalMoves(), geometry, cachedRangeNode);
+            activateSliderSession(session);
+            pendingRangeSliderKey.compareAndSet(initialRange.key(), null);
+            try {
+                SliderStep first = awaitSliderStep(geometry, session, 1, initial, firstColor,
+                        null, firstAction, metrics);
+                if (first == null) {
+                    return SliderReplayResult.fallback("高速経路で1手目の盤面を確定できません");
+                }
+
+                ArrayList<Move> moves = new ArrayList<>();
+                moves.add(first.move());
+                metrics.acceptedSliderMove();
+                activeMoveCount = 1;
+                ArrayList<BoardState> history = new ArrayList<>();
+                history.add(initial);
+                history.add(first.state());
+                byte nextColor = firstColor == BoardState.BLACK
+                        ? BoardState.WHITE : BoardState.BLACK;
+                return replaySliderIndexes(geometry, session, 1, first.state(), nextColor,
+                        moves, history, first.thumb(), metrics);
+            } finally {
+                closeSliderSession(session);
+            }
+        } finally {
+            pendingRangeSliderKey.compareAndSet(initialRange.key(), null);
+        }
+    }
+
+    private SliderReplayResult replaySliderIndexes(ScreenGeometry geometry,
+                                                    SliderSession session,
+                                                    int completedIndexes,
+                                                    BoardState current,
+                                                    byte expected,
+                                                    ArrayList<Move> moves,
+                                                    ArrayList<BoardState> history,
+                                                    PointF currentThumb,
+                                                    ScanMetrics metrics) throws Exception {
+        long lastProgressUpdate = 0L;
+        for (int index = completedIndexes + 1; index <= session.totalMoves(); index++) {
+            checkCancelled();
+            SliderAction action = seekSliderIndex(
+                    geometry, session, index - 1, index, currentThumb, metrics);
+            if (action == null) {
+                return SliderReplayResult.fallback("手数バーを" + index + "手目へ移動できません");
+            }
+
+            BoardState twoPliesAgo = history.size() >= 2
+                    ? history.get(history.size() - 2) : null;
+            SliderStep step = awaitSliderStep(geometry, session, index, current, expected,
+                    twoPliesAgo, action, metrics);
+            if (step == null) {
+                return SliderReplayResult.fallback(index + "手目の局面を一手として検証できません");
+            }
+
+            moves.add(step.move());
+            history.add(step.state());
+            current = step.state();
+            currentThumb = step.thumb();
+            expected = expected == BoardState.BLACK ? BoardState.WHITE : BoardState.BLACK;
+            activeMoveCount = moves.size();
+            metrics.acceptedSliderMove();
+
+            long now = SystemClock.uptimeMillis();
+            if (now - lastProgressUpdate >= PROGRESS_UPDATE_INTERVAL_MS) {
+                setOverlayStatus("SHS高速読取：" + index + "/" + session.totalMoves() + "手");
+                lastProgressUpdate = now;
+            }
+        }
+
+        SliderSeekPlan.Snapshot finalSnapshot = readSliderSessionSnapshot(geometry, session);
+        if (finalSnapshot == null
+                || !session.plan().matchesRange(finalSnapshot)
+                || !session.plan().isAtIndex(finalSnapshot.current(), session.totalMoves())
+                || moves.size() != session.totalMoves()) {
+            return SliderReplayResult.fallback("手数バー右端の最終局面を確認できません");
+        }
+        return SliderReplayResult.success(moves);
+    }
+
+    private SliderAction seekSliderIndex(ScreenGeometry geometry, SliderSession session,
+                                         int previousIndex, int targetIndex, PointF currentThumb,
+                                         ScanMetrics metrics) throws Exception {
+        long seekStarted = metrics.mark();
+        try {
+            if (session.mode() == SliderMode.RANGE) {
+                return setRangeSliderIndexOnMain(session, previousIndex, targetIndex);
+            }
+            if (currentThumb == null) return null;
+            double progress = targetIndex / (double) session.totalMoves();
+            PointF target = geometry.sliderPoint(progress);
+            return gestureSwipe(geometry, currentThumb, target, SHS_SEEK_DURATION_MS);
+        } finally {
+            metrics.addSliderSeek(seekStarted);
+        }
+    }
+
+    private SliderAcknowledgement awaitSliderAcknowledgement(
+            ScreenGeometry geometry, SliderSession session, int targetIndex,
+            SliderAction action, ScanMetrics metrics) throws Exception {
+        long deadline = SystemClock.uptimeMillis() + SHS_INDEX_ACK_TIMEOUT_MS;
+        long eventOnlyDeadline = Math.min(deadline, SystemClock.uptimeMillis() + 40L);
+        while (SystemClock.uptimeMillis() < eventOnlyDeadline) {
+            checkCancelled();
+            SliderAcknowledgement event = sliderEventAcknowledgement(
+                    geometry, session, targetIndex, action.startedUptimeMillis());
+            if (event != null) {
+                metrics.sliderEventAck();
+                return event;
+            }
+            Thread.sleep(SHS_ACK_POLL_MS);
+        }
+
+        SliderSeekPlan.Snapshot observed = readSliderSessionSnapshot(geometry, session);
+        if (isAcknowledgedIndex(session, observed, targetIndex)) {
+            metrics.sliderSnapshotAck();
+            long now = SystemClock.uptimeMillis();
+            return new SliderAcknowledgement(observed, now, now,
+                    CaptureService.currentSequence(), false);
+        }
+        if (observed != null && session.plan().matchesRange(observed)
+                && session.plan().indexOf(observed.current()) > targetIndex) return null;
+
+        while (SystemClock.uptimeMillis() < deadline) {
+            checkCancelled();
+            SliderAcknowledgement event = sliderEventAcknowledgement(
+                    geometry, session, targetIndex, action.startedUptimeMillis());
+            if (event != null) {
+                metrics.sliderEventAck();
+                return event;
+            }
+            Thread.sleep(SHS_ACK_POLL_MS);
+        }
+        return null;
+    }
+
+    private SliderAcknowledgement sliderEventAcknowledgement(
+            ScreenGeometry geometry, SliderSession session, int targetIndex,
+            long actionStartedUptimeMillis) {
+        SliderSeekPlan.Snapshot snapshot;
+        SliderEventStamp stamp;
+        if (session.mode() == SliderMode.RANGE) {
+            CachedRangeSliderEvent event = latestRangeSliderEvent();
+            if (event == null
+                    || event.stamp().eventUptimeMillis() < actionStartedUptimeMillis
+                    || !matchesSliderKey(session.key(), event.stamp().source().sliderKey())) {
+                return null;
+            }
+            snapshot = event.raw();
+            stamp = event.stamp();
+        } else {
+            CachedTextSliderEvent event = latestTextSliderEvent();
+            if (event == null
+                    || event.stamp().eventUptimeMillis() < actionStartedUptimeMillis
+                    || event.index().total() != session.totalMoves()
+                    || !geometry.isReplayControlRow(event.stamp().source().sliderKey().bounds())) {
+                return null;
+            }
+            snapshot = new SliderSeekPlan.Snapshot(
+                    0, event.index().total(), event.index().current());
+            stamp = event.stamp();
+        }
+        if (!isAcknowledgedIndex(session, snapshot, targetIndex)) return null;
+        return new SliderAcknowledgement(snapshot, stamp.eventUptimeMillis(),
+                stamp.receivedUptimeMillis(), stamp.captureSequence(), true);
+    }
+
+    private static boolean isAcknowledgedIndex(SliderSession session,
+                                                SliderSeekPlan.Snapshot snapshot,
+                                                int targetIndex) {
+        return snapshot != null
+                && session.plan().matchesRange(snapshot)
+                && session.plan().isAtIndex(snapshot.current(), targetIndex);
+    }
+
+    private boolean sliderSessionStillAtIndex(
+            ScreenGeometry geometry, SliderSession session, int targetIndex,
+            SliderAcknowledgement acknowledged) {
+        if (session.mode() == SliderMode.RANGE) {
+            CachedRangeSliderEvent event = latestRangeSliderEvent();
+            if (event == null
+                    || event.stamp().eventUptimeMillis() < acknowledged.eventUptimeMillis()
+                    || event.stamp().receivedUptimeMillis() < acknowledged.receivedUptimeMillis()
+                    || !matchesSliderKey(session.key(), event.stamp().source().sliderKey())) {
+                return true;
+            }
+            return isAcknowledgedIndex(session, event.raw(), targetIndex);
+        }
+        CachedTextSliderEvent event = latestTextSliderEvent();
+        if (event == null
+                || event.stamp().eventUptimeMillis() < acknowledged.eventUptimeMillis()
+                || event.stamp().receivedUptimeMillis() < acknowledged.receivedUptimeMillis()
+                || event.index().total() != session.totalMoves()
+                || !geometry.isReplayControlRow(event.stamp().source().sliderKey().bounds())) {
+            return true;
+        }
+        SliderSeekPlan.Snapshot snapshot = new SliderSeekPlan.Snapshot(
+                0, event.index().total(), event.index().current());
+        return isAcknowledgedIndex(session, snapshot, targetIndex);
+    }
+
+    private SliderStep awaitSliderStep(ScreenGeometry geometry, SliderSession session,
+                                       int targetIndex, BoardState before, byte expected,
+                                       BoardState twoPliesAgo, SliderAction action,
+                                       ScanMetrics metrics) throws Exception {
+        SliderAcknowledgement acknowledged = awaitSliderAcknowledgement(
+                geometry, session, targetIndex, action, metrics);
+        if (acknowledged == null) return null;
+
+        long acknowledgedAt = acknowledged.receivedUptimeMillis();
+        // Frames produced between dispatch and ACK can already contain the completed ordinary
+        // move, so inspect them instead of discarding them. They may commit a legal board change,
+        // but only a frame strictly newer than the ACK may count as unchanged/pass evidence.
+        long sequence = action.frameSequence();
+        long deadline = acknowledgedAt + SHS_STEP_TIMEOUT_MS;
+        SliderPassGate passGate = new SliderPassGate(acknowledgedAt);
+        long lastPassProbeAt = Long.MIN_VALUE;
+        while (SystemClock.uptimeMillis() < deadline) {
+            checkCancelled();
+            long now = SystemClock.uptimeMillis();
+            long remaining = deadline - now;
+            boolean passWasReady = passGate.canRequestExplicitPassConfirmation(now);
+            boolean passEvidenceWindow = passGate.canRequestAdditionalFreshEvidence(now);
+            boolean passProbeCooledDown = lastPassProbeAt == Long.MIN_VALUE
+                    || now - lastPassProbeAt >= SHS_PASS_PROBE_INTERVAL_MS;
+            boolean explicitPassCheck = passEvidenceWindow && passProbeCooledDown;
+            long waitStarted = metrics.mark();
+            CaptureService.CapturedFrame captured = null;
+            Bitmap bitmap;
+            if (explicitPassCheck) {
+                lastPassProbeAt = now;
+                bitmap = captureWithAccessibility(Math.min(
+                        SHS_PASS_SCREENSHOT_TIMEOUT_MS, Math.max(1L, remaining)));
+                metrics.sliderPassProbe();
+            } else {
+                long captureWaitMs = Math.min(FRESH_FRAME_WAIT_MS,
+                        Math.min(SliderPassGate.MIN_QUIET_MS, Math.max(1L, remaining)));
+                if (passEvidenceWindow && lastPassProbeAt != Long.MIN_VALUE) {
+                    long untilNextProbe = SHS_PASS_PROBE_INTERVAL_MS
+                            - Math.max(0L, now - lastPassProbeAt);
+                    captureWaitMs = Math.min(captureWaitMs, Math.max(1L, untilNextProbe));
+                }
+                captured = CaptureService.captureAfter(sequence, Math.min(
+                        captureWaitMs, Math.max(1L, remaining)));
+                bitmap = captured == null ? null : captured.bitmap();
+            }
+            metrics.addFreshFrameWait(waitStarted, bitmap != null);
+            if (bitmap == null) {
+                if (!CaptureService.isReady()) return null;
+                continue;
+            }
+            long capturedSequence = captured == null ? -1L : captured.sequence();
+            if (captured != null) sequence = Math.max(sequence, capturedSequence);
+            try {
+                if (!sliderSessionStillAtIndex(
+                        geometry, session, targetIndex, acknowledged)) {
+                    return null;
+                }
+
+                shsFramePixels.bind(bitmap, geometry.board, Math.round(geometry.sliderLeft.y));
+                PointF thumb = null;
+                if (session.mode() == SliderMode.TEXT) {
+                    try {
+                        thumb = geometry.sliderThumb(shsFramePixels);
+                    } catch (IllegalStateException missingThumb) {
+                        passGate.observeInvalidOrPartial(SystemClock.uptimeMillis());
+                        continue;
+                    }
+                    double visualProgress = geometry.sliderProgressForX(thumb.x);
+                    double expectedProgress = targetIndex / (double) session.totalMoves();
+                    double tolerance = visualIndexTolerance(geometry);
+                    if (Math.abs(visualProgress - expectedProgress) > tolerance) {
+                        passGate.observeInvalidOrPartial(SystemClock.uptimeMillis());
+                        continue;
+                    }
+                }
+
+                long analyzeStarted = metrics.mark();
+                BoardAnalyzer.Detection detection = BoardAnalyzer.detect(
+                        shsFramePixels, geometry.board);
+                metrics.addBoardAnalysis(analyzeStarted);
+                if (detection.confidence() < SHS_MIN_CONFIDENCE) {
+                    passGate.observeInvalidOrPartial(SystemClock.uptimeMillis());
+                    continue;
+                }
+
+                BoardState observed = detection.state();
+                SliderStepValidator.Result validation = SliderStepValidator.validate(
+                        before, observed, expected, twoPliesAgo);
+                if (validation.valid() && validation.move().pass()) {
+                    metrics.sliderUnchangedFrame();
+                    boolean postAcknowledgementEvidence = explicitPassCheck
+                            || capturedSequence > acknowledged.frameSequence();
+                    if (!postAcknowledgementEvidence) continue;
+                    boolean passReady = passGate.observeUnchangedFreshFrame(
+                            SystemClock.uptimeMillis());
+                    if (explicitPassCheck && passWasReady && passReady) {
+                        SliderSeekPlan.Snapshot confirmed = readSliderSessionSnapshot(
+                                geometry, session);
+                        if (!isAcknowledgedIndex(session, confirmed, targetIndex)) return null;
+                        return new SliderStep(validation.move(), before, thumb);
+                    }
+                    continue;
+                }
+                if (validation.valid()) {
+                    return new SliderStep(validation.move(), observed, thumb);
+                }
+                passGate.observeInvalidOrPartial(SystemClock.uptimeMillis());
+            } finally {
+                shsFramePixels.releaseFrame();
+                if (!bitmap.isRecycled()) bitmap.recycle();
+            }
+        }
+        return null;
+    }
+
+    private static double visualIndexTolerance(ScreenGeometry geometry) {
+        return Math.max(SHS_THUMB_UNCERTAINTY_PIXELS / geometry.sliderTrackWidth(),
+                SHS_MIN_VISUAL_PROGRESS_TOLERANCE);
+    }
+
+    private PointF latestSliderThumb(ScreenGeometry geometry) {
+        CaptureService.CapturedFrame captured = CaptureService.latestFrame();
+        if (captured == null) return null;
+        try {
+            return geometry.sliderThumb(captured.bitmap());
+        } catch (IllegalStateException ignored) {
+            return null;
+        } finally {
+            captured.recycle();
+        }
+    }
+
+    private SliderRangeSnapshot awaitChangedRangeSlider(ScreenGeometry geometry,
+                                                        SliderRangeSnapshot initial,
+                                                        SliderAction action,
+                                                        long timeoutMs) throws InterruptedException {
+        long deadline = SystemClock.uptimeMillis() + timeoutMs;
+        while (SystemClock.uptimeMillis() < deadline) {
+            checkCancelled();
+            CachedRangeSliderEvent event = latestRangeSliderEvent();
+            SliderRangeSnapshot observed = null;
+            if (event != null
+                    && event.stamp().eventUptimeMillis() >= action.startedUptimeMillis()
+                    && matchesSliderKey(initial.key(), event.stamp().source().sliderKey())) {
+                observed = new SliderRangeSnapshot(
+                        event.stamp().source().sliderKey(), event.range(), event.raw());
+            }
+            if (observed != null
+                    && observed.range().moveCount() == initial.range().moveCount()
+                    && observed.raw().min() == initial.raw().min()
+                    && observed.raw().max() == initial.raw().max()
+                    && observed.raw().current() > initial.raw().current()) {
+                return observed;
+            }
+            Thread.sleep(SHS_ACK_POLL_MS);
+        }
+        SliderRangeSnapshot observed = findReplayRangeSliderOnMain(geometry, initial.key());
+        if (observed == null
+                || observed.range().moveCount() != initial.range().moveCount()
+                || observed.raw().min() != initial.raw().min()
+                || observed.raw().max() != initial.raw().max()
+                || observed.raw().current() <= initial.raw().current()) return null;
+        return observed;
+    }
+
+    private SliderSeekPlan.Snapshot readSliderSessionSnapshot(
+            ScreenGeometry geometry, SliderSession session) throws InterruptedException {
+        if (session.mode() == SliderMode.RANGE) {
+            AtomicReference<SliderRangeSnapshot> refreshed = new AtomicReference<>();
+            runOnMainSync(() -> refreshed.set(refreshCachedRangeSliderNode(
+                    session.cachedRangeNode(), session.key())), 350);
+            SliderRangeSnapshot range = refreshed.get();
+            if (range == null) {
+                range = findReplayRangeSliderOnMain(geometry, session.key());
+            }
+            return range == null ? null : range.raw();
+        }
+        SliderIndexTextParser.Snapshot text = readSliderTextIndex(geometry);
+        if (text == null || text.total() != session.totalMoves()) return null;
+        return new SliderSeekPlan.Snapshot(0, text.total(), text.current());
+    }
+
+    private SliderIndexTextParser.Snapshot readSliderTextIndex(ScreenGeometry geometry)
+            throws InterruptedException {
+        SliderIndexTextParser.Snapshot found = null;
+        for (MetadataReader.UiText item : collectWindowTextsOnMain()) {
+            if (!geometry.isReplayControlRow(item.bounds())) continue;
+            SliderIndexTextParser.Snapshot parsed = SliderIndexTextParser.parse(item.text());
+            if (parsed == null) continue;
+            if (found != null && !found.equals(parsed)) return null;
+            found = parsed;
+        }
+        return found;
+    }
+
+    private SliderAction setRangeSliderIndexOnMain(SliderSession session,
+                                                   int previousIndex, int targetIndex)
+            throws InterruptedException {
+        AtomicReference<SliderAction> accepted = new AtomicReference<>();
+        runOnMainSync(() -> {
+            AccessibilityNodeInfo node = session.cachedRangeNode();
+            SliderRangeSnapshot current = refreshCachedRangeSliderNode(node, session.key());
+            if (!isExpectedRangePosition(session, current, previousIndex)) {
+                session.discardCachedRangeNode(node);
+                node = replaceCachedRangeNodeFromTree(session, previousIndex);
+            }
+            if (node == null) return;
+
+            try {
+                SliderAction action = new SliderAction(
+                        CaptureService.currentSequence(), SystemClock.uptimeMillis());
+                if (performRangeSliderAction(node, session, targetIndex)) accepted.set(action);
+            } catch (Throwable ignored) {
+                accepted.set(null);
+            }
+
+            // A node can become stale between a successful refresh and performAction(). Resolve
+            // the exact same slider once more only in that failure case; normal moves never walk
+            // the complete accessibility tree.
+            if (accepted.get() == null) {
+                session.discardCachedRangeNode(node);
+                AccessibilityNodeInfo replacement = replaceCachedRangeNodeFromTree(
+                        session, previousIndex);
+                if (replacement != null) {
+                    try {
+                        SliderAction action = new SliderAction(
+                                CaptureService.currentSequence(), SystemClock.uptimeMillis());
+                        if (performRangeSliderAction(replacement, session, targetIndex)) {
+                            accepted.set(action);
+                        }
+                    } catch (Throwable ignored) {
+                        accepted.set(null);
+                    }
+                }
+            }
+        }, 700);
+        return accepted.get();
+    }
+
+    private AccessibilityNodeInfo obtainRangeSliderNodeOnMain(
+            ScreenGeometry geometry, SliderKey requiredKey,
+            SliderSeekPlan plan, int expectedIndex) throws InterruptedException {
+        AtomicReference<AccessibilityNodeInfo> result = new AtomicReference<>();
+        runOnMainSync(() -> {
+            SliderNodeCandidate candidate = findReplayRangeSliderNow(geometry, requiredKey);
+            if (candidate == null) return;
+            boolean retained = false;
+            try {
+                SliderSeekPlan.Snapshot current = candidate.snapshot().raw();
+                if (plan.matchesRange(current)
+                        && plan.isAtIndex(current.current(), expectedIndex)) {
+                    result.set(candidate.node());
+                    retained = true;
+                }
+            } finally {
+                if (!retained) candidate.node().recycle();
+            }
+        }, 900);
+        return result.get();
+    }
+
+    private AccessibilityNodeInfo replaceCachedRangeNodeFromTree(
+            SliderSession session, int expectedIndex) {
+        SliderNodeCandidate candidate = findReplayRangeSliderNow(null, session.key());
+        if (candidate == null) return null;
+        boolean retained = false;
+        try {
+            if (!isExpectedRangePosition(session, candidate.snapshot(), expectedIndex)) {
+                return null;
+            }
+            if (!session.replaceCachedRangeNode(candidate.node())) return null;
+            retained = true;
+            return candidate.node();
+        } finally {
+            if (!retained) candidate.node().recycle();
+        }
+    }
+
+    private SliderRangeSnapshot refreshCachedRangeSliderNode(
+            AccessibilityNodeInfo node, SliderKey requiredKey) {
+        if (node == null) return null;
+        try {
+            if (!node.refresh()) return null;
+            return rangeSnapshotFromNode(node, requiredKey);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private SliderRangeSnapshot rangeSnapshotFromNode(
+            AccessibilityNodeInfo node, SliderKey requiredKey) {
+        if (node == null || !node.isVisibleToUser() || !node.isEnabled()
+                || !supportsSetProgress(node)) return null;
+        CharSequence packageValue = node.getPackageName();
+        String packageName = packageValue == null ? "" : packageValue.toString();
+        if (getPackageName().equals(packageName)) return null;
+        AccessibilityNodeInfo.RangeInfo info = node.getRangeInfo();
+        if (info == null
+                || info.getType() != AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INT) return null;
+
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        SliderKey key = sliderKey(node, packageName, bounds);
+        if (requiredKey != null && !matchesSliderKey(requiredKey, key)) return null;
+        try {
+            SliderIndexRange range = SliderIndexRange.from(
+                    info.getMin(), info.getMax(), info.getCurrent(), true);
+            SliderSeekPlan.Snapshot raw = new SliderSeekPlan.Snapshot(
+                    info.getMin(), info.getMax(), info.getCurrent());
+            return new SliderRangeSnapshot(key, range, raw);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isExpectedRangePosition(
+            SliderSession session, SliderRangeSnapshot snapshot, int expectedIndex) {
+        if (snapshot == null) return false;
+        SliderSeekPlan.Snapshot current = snapshot.raw();
+        return session.plan().matchesRange(current)
+                && session.plan().isAtIndex(current.current(), expectedIndex);
+    }
+
+    private static boolean performRangeSliderAction(
+            AccessibilityNodeInfo node, SliderSession session, int targetIndex) {
+        Bundle arguments = new Bundle();
+        arguments.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE,
+                (float) session.plan().targetForIndex(targetIndex));
+        return node.performAction(
+                AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(),
+                arguments);
+    }
+
+    private SliderRangeSnapshot findReplayRangeSliderOnMain(
+            ScreenGeometry geometry, SliderKey requiredKey) throws InterruptedException {
+        AtomicReference<SliderRangeSnapshot> result = new AtomicReference<>();
+        runOnMainSync(() -> {
+            SliderNodeCandidate candidate = findReplayRangeSliderNow(geometry, requiredKey);
+            if (candidate == null) return;
+            try {
+                result.set(candidate.snapshot());
+            } finally {
+                candidate.node().recycle();
+            }
+        }, 900);
+        return result.get();
+    }
+
+    private SliderNodeCandidate findReplayRangeSliderNow(
+            ScreenGeometry geometry, SliderKey requiredKey) {
+        ArrayList<SliderNodeCandidate> candidates = new ArrayList<>();
+        int[] remaining = {SHS_NODE_LIMIT};
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows != null) {
+                for (AccessibilityWindowInfo window : windows) {
+                    try {
+                        if (remaining[0] > 0) {
+                            AccessibilityNodeInfo root = window.getRoot();
+                            if (root != null) {
+                                try {
+                                    collectRangeSliderNodes(
+                                            root, geometry, requiredKey, candidates, remaining);
+                                } finally {
+                                    root.recycle();
+                                }
+                            }
+                        }
+                    } finally {
+                        window.recycle();
+                    }
+                }
+            }
+            if (candidates.isEmpty()) {
+                AccessibilityNodeInfo root = getRootInActiveWindow();
+                if (root != null) {
+                    try {
+                        collectRangeSliderNodes(root, geometry, requiredKey, candidates, remaining);
+                    } finally {
+                        root.recycle();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            recycleSliderCandidates(candidates);
+            return null;
+        }
+        if (candidates.size() != 1) {
+            recycleSliderCandidates(candidates);
+            return null;
+        }
+        return candidates.get(0);
+    }
+
+    private void collectRangeSliderNodes(AccessibilityNodeInfo node,
+                                         ScreenGeometry geometry,
+                                         SliderKey requiredKey,
+                                         List<SliderNodeCandidate> out,
+                                         int[] remaining) {
+        if (node == null || remaining[0]-- <= 0) return;
+        CharSequence packageValue = node.getPackageName();
+        String packageName = packageValue == null ? "" : packageValue.toString();
+        boolean ownOverlay = getPackageName().equals(packageName);
+        if (!ownOverlay && node.isVisibleToUser() && node.isEnabled()
+                && supportsSetProgress(node)) {
+            AccessibilityNodeInfo.RangeInfo info = node.getRangeInfo();
+            if (info != null) {
+                Rect bounds = new Rect();
+                node.getBoundsInScreen(bounds);
+                boolean plausibleBounds = geometry == null
+                        ? requiredKey != null && matchesSliderKey(requiredKey,
+                        sliderKey(node, packageName, bounds))
+                        : geometry.isSliderControlBounds(bounds);
+                if (plausibleBounds) {
+                    try {
+                        boolean discrete = info.getType()
+                                == AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INT;
+                        SliderIndexRange range = SliderIndexRange.from(
+                                info.getMin(), info.getMax(), info.getCurrent(), discrete);
+                        SliderKey key = sliderKey(node, packageName, bounds);
+                        if (requiredKey == null || matchesSliderKey(requiredKey, key)) {
+                            SliderSeekPlan.Snapshot raw = new SliderSeekPlan.Snapshot(
+                                    info.getMin(), info.getMax(), info.getCurrent());
+                            out.add(new SliderNodeCandidate(AccessibilityNodeInfo.obtain(node),
+                                    new SliderRangeSnapshot(key, range, raw)));
+                        }
+                    } catch (IllegalArgumentException ignored) {
+                        // Continuous, normalized or malformed ranges are not exact move indexes.
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < node.getChildCount() && remaining[0] > 0; i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child == null) continue;
+            try {
+                collectRangeSliderNodes(child, geometry, requiredKey, out, remaining);
+            } finally {
+                child.recycle();
+            }
+        }
+    }
+
+    private static boolean supportsSetProgress(AccessibilityNodeInfo node) {
+        for (AccessibilityNodeInfo.AccessibilityAction action : node.getActionList()) {
+            if (action.getId()
+                    == AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static SliderKey sliderKey(AccessibilityNodeInfo node,
+                                       String packageName, Rect bounds) {
+        String viewId = node.getViewIdResourceName();
+        CharSequence classValue = node.getClassName();
+        String className = classValue == null ? "" : classValue.toString();
+        return new SliderKey(packageName, viewId == null ? "" : viewId,
+                className, new Rect(bounds));
+    }
+
+    private static boolean matchesSliderKey(SliderKey expected, SliderKey actual) {
+        if (expected == null || actual == null
+                || !expected.packageName().equals(actual.packageName())
+                || !expected.className().equals(actual.className())) return false;
+        if (!expected.viewId().isBlank() || !actual.viewId().isBlank()) {
+            return expected.viewId().equals(actual.viewId());
+        }
+        Rect a = expected.bounds();
+        Rect b = actual.bounds();
+        return Math.abs(a.centerX() - b.centerX()) <= 4
+                && Math.abs(a.centerY() - b.centerY()) <= 4
+                && Math.abs(a.width() - b.width()) <= 8
+                && Math.abs(a.height() - b.height()) <= 8;
+    }
+
+    private static void recycleSliderCandidates(List<SliderNodeCandidate> candidates) {
+        for (SliderNodeCandidate candidate : candidates) {
+            try {
+                candidate.node().recycle();
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     private Outcome advanceOne(ScreenGeometry geometry, BoardState before,
@@ -903,14 +2006,31 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             List<AccessibilityWindowInfo> windows = getWindows();
             if (windows != null) {
                 for (AccessibilityWindowInfo window : windows) {
-                    AccessibilityNodeInfo root = window.getRoot();
-                    if (root != null) collectNodeText(root, result, remaining);
-                    if (remaining[0] <= 0) break;
+                    try {
+                        if (remaining[0] > 0) {
+                            AccessibilityNodeInfo root = window.getRoot();
+                            if (root != null) {
+                                try {
+                                    collectNodeText(root, result, remaining);
+                                } finally {
+                                    root.recycle();
+                                }
+                            }
+                        }
+                    } finally {
+                        window.recycle();
+                    }
                 }
             }
             if (result.isEmpty()) {
                 AccessibilityNodeInfo root = getRootInActiveWindow();
-                if (root != null) collectNodeText(root, result, remaining);
+                if (root != null) {
+                    try {
+                        collectNodeText(root, result, remaining);
+                    } finally {
+                        root.recycle();
+                    }
+                }
             }
         } catch (Throwable ignored) {
             // Some vendors expose only screenshots. MetadataReader has safe fallbacks.
@@ -935,7 +2055,12 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         }
         for (int i = 0; i < node.getChildCount() && remaining[0] > 0; i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) collectNodeText(child, out, remaining);
+            if (child == null) continue;
+            try {
+                collectNodeText(child, out, remaining);
+            } finally {
+                child.recycle();
+            }
         }
     }
 
@@ -958,22 +2083,22 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         return SystemClock.uptimeMillis() < terminalSignalUntil;
     }
 
-    private void gestureTap(ScreenGeometry geometry, PointF point) throws Exception {
+    private SliderAction gestureTap(ScreenGeometry geometry, PointF point) throws Exception {
         geometry.requireSafe(point);
         Path path = new Path();
         path.moveTo(point.x, point.y);
-        performGesture(new GestureDescription.Builder().addStroke(
+        return performGesture(new GestureDescription.Builder().addStroke(
                 new GestureDescription.StrokeDescription(path, 0, TAP_DURATION_MS)).build());
     }
 
-    private void gestureSwipe(ScreenGeometry geometry, PointF from, PointF to,
-                              long durationMs) throws Exception {
+    private SliderAction gestureSwipe(ScreenGeometry geometry, PointF from, PointF to,
+                                      long durationMs) throws Exception {
         geometry.requireSafe(from);
         geometry.requireSafe(to);
         Path path = new Path();
         path.moveTo(from.x, from.y);
         path.lineTo(to.x, to.y);
-        performGesture(new GestureDescription.Builder().addStroke(
+        return performGesture(new GestureDescription.Builder().addStroke(
                 new GestureDescription.StrokeDescription(path, 0, durationMs)).build());
     }
 
@@ -994,20 +2119,34 @@ public final class ReaderAccessibilityService extends AccessibilityService {
 
     private Bitmap captureWithAccessibility(long timeoutMs) throws InterruptedException {
         CountDownLatch latch = new CountDownLatch(1);
-        AtomicReference<Bitmap> result = new AtomicReference<>();
+        Object ownershipLock = new Object();
+        Bitmap[] result = {null};
+        boolean[] accepting = {true};
         main.post(() -> {
             try {
                 takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
                     @Override public void onSuccess(ScreenshotResult screenshot) {
                         HardwareBuffer buffer = screenshot.getHardwareBuffer();
+                        Bitmap copy = null;
+                        Bitmap wrapped = null;
                         try {
-                            Bitmap wrapped = Bitmap.wrapHardwareBuffer(buffer, screenshot.getColorSpace());
-                            if (wrapped != null) {
-                                result.set(wrapped.copy(Bitmap.Config.ARGB_8888, false));
+                            wrapped = Bitmap.wrapHardwareBuffer(
+                                    buffer, screenshot.getColorSpace());
+                            if (wrapped != null) copy = wrapped.copy(Bitmap.Config.ARGB_8888, false);
+                            synchronized (ownershipLock) {
+                                if (accepting[0]) {
+                                    result[0] = copy;
+                                    copy = null;
+                                }
                             }
                         } finally {
-                            buffer.close();
-                            latch.countDown();
+                            if (copy != null && !copy.isRecycled()) copy.recycle();
+                            if (wrapped != null && !wrapped.isRecycled()) wrapped.recycle();
+                            try {
+                                buffer.close();
+                            } finally {
+                                latch.countDown();
+                            }
                         }
                     }
 
@@ -1019,14 +2158,34 @@ public final class ReaderAccessibilityService extends AccessibilityService {
                 latch.countDown();
             }
         });
-        return latch.await(timeoutMs, TimeUnit.MILLISECONDS) ? result.get() : null;
+        try {
+            latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException interrupted) {
+            Bitmap abandoned;
+            synchronized (ownershipLock) {
+                accepting[0] = false;
+                abandoned = result[0];
+                result[0] = null;
+            }
+            if (abandoned != null && !abandoned.isRecycled()) abandoned.recycle();
+            throw interrupted;
+        }
+        synchronized (ownershipLock) {
+            accepting[0] = false;
+            Bitmap captured = result[0];
+            result[0] = null;
+            return captured;
+        }
     }
 
-    private void performGesture(GestureDescription description) throws Exception {
+    private SliderAction performGesture(GestureDescription description) throws Exception {
         CountDownLatch latch = new CountDownLatch(1);
         boolean[] ok = {false};
+        SliderAction[] action = {null};
         main.post(() -> {
             try {
+                action[0] = new SliderAction(
+                        CaptureService.currentSequence(), SystemClock.uptimeMillis());
                 boolean accepted = dispatchGesture(description, new GestureResultCallback() {
                     @Override public void onCompleted(GestureDescription gesture) {
                         ok[0] = true;
@@ -1045,6 +2204,10 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         if (!latch.await(3, TimeUnit.SECONDS) || !ok[0]) {
             throw new IllegalStateException("ユーザー補助の画面操作に失敗しました");
         }
+        if (action[0] == null) {
+            throw new IllegalStateException("ユーザー補助の画面操作時刻を取得できません");
+        }
+        return action[0];
     }
 
     private void checkCancelled() {
@@ -1106,16 +2269,29 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             return;
         }
         CountDownLatch latch = new CountDownLatch(1);
+        AtomicBoolean pending = new AtomicBoolean(true);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
         main.post(() -> {
+            if (!pending.compareAndSet(true, false)) {
+                latch.countDown();
+                return;
+            }
             try {
                 action.run();
+            } catch (Throwable error) {
+                failure.set(error);
             } finally {
                 latch.countDown();
             }
         });
         if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            pending.compareAndSet(true, false);
             throw new IllegalStateException("操作パネルの制御がタイムアウトしました");
         }
+        Throwable error = failure.get();
+        if (error instanceof RuntimeException runtime) throw runtime;
+        if (error instanceof Error fatal) throw fatal;
+        if (error != null) throw new IllegalStateException("メイン画面の操作に失敗しました", error);
     }
 
     private void setOverlayStatus(String text) {
@@ -1143,6 +2319,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
 
     private void exitReader() {
         cancelled = true;
+        closeActiveSliderSession();
         if (overlay != null) {
             try {
                 windowManager.removeView(overlay);
@@ -1161,6 +2338,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
 
     @Override public void onDestroy() {
         cancelled = true;
+        closeActiveSliderSession();
         worker.shutdownNow();
         ocrWorker.shutdownNow();
         HeaderTextRecognizer.close();

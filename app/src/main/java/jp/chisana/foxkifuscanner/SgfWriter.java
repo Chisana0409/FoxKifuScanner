@@ -8,7 +8,7 @@ public final class SgfWriter {
 
     public static String build(GameMetadata meta, List<Move> moves, LocalDate date) {
         StringBuilder out = new StringBuilder(2048);
-        out.append("(;GM[1]FF[4]CA[UTF-8]AP[FoxKifuScanner:1.2.0]SZ[19]");
+        out.append("(;GM[1]FF[4]CA[UTF-8]AP[FoxKifuScanner:1.3.2-shs20]SZ[19]");
         out.append("DT[").append(date).append(']');
         out.append("PB[").append(escape(meta.blackName)).append(']');
         if (!meta.blackRank.isBlank()) out.append("BR[").append(escape(meta.blackRank)).append(']');
