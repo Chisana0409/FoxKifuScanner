@@ -33,8 +33,10 @@ public class CoreTest {
 
     @Test public void commonResultFormsAreParsed() {
         assertEquals("B+R", MetadataReader.parseResult("黒 中盤勝ち"));
+        assertEquals("B+R", MetadataReader.parseResult("黒\n中盤勝ち"));
         assertEquals("W+0.5", MetadataReader.parseResult("白 半目勝ち"));
         assertEquals("B+3.5", MetadataReader.parseResult("黒 3目半勝ち"));
+        assertEquals("B+1.5", MetadataReader.parseResult("黒\n3/4子"));
         assertEquals("0", MetadataReader.parseResult("持碁"));
     }
 

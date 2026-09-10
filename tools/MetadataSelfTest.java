@@ -12,6 +12,8 @@ public final class MetadataSelfTest {
         require(MetadataReader.parseResult("白 半目勝ち").equals("W+0.5"), "half point");
         require(MetadataReader.parseResult("黒 3目半勝ち").equals("B+3.5"), "point and half");
         require(metadata.place.equals("野狐囲碁"), "game place");
+        require(MetadataReader.parseResult("黒\n3/4子").equals("B+1.5"), "split-line child conversion");
+        require(MetadataReader.parseResult("黒\n中盤勝ち").equals("B+R"), "split-line resignation conversion");
         System.out.println("MetadataSelfTest: all checks passed");
     }
 
