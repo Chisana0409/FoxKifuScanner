@@ -10,6 +10,8 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.ViewGroup;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.widget.*;
 
 public final class MainActivity extends Activity {
@@ -37,11 +39,14 @@ public final class MainActivity extends Activity {
 
     private ScrollView buildUi() {
         int pad = dp(20);
+        getWindow().setStatusBarColor(Color.rgb(8, 24, 40));
+        getWindow().setNavigationBarColor(Color.rgb(5, 15, 27));
         LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL); content.setPadding(pad, pad, pad, pad);
-        TextView title = text("野狐棋譜スキャナー", 25); title.setTextColor(0xFF0B6172); content.addView(title);
+        content.setOrientation(LinearLayout.VERTICAL); content.setPadding(pad, dp(18), pad, dp(28));
+        content.setBackgroundColor(Color.rgb(7, 20, 34));
+        TextView title = text("野狐棋譜スキャナー", 25); title.setTextColor(0xFFE7F7FF); title.setTypeface(null, android.graphics.Typeface.BOLD); content.addView(title);
         TextView intro = text("野狐囲碁の棋譜画面を一手ずつ操作し、盤面と対局情報からSGFを作成します。画像は端末内だけで処理し、通信内容やログイン情報にはアクセスしません。", 15);
-        intro.setPadding(0, dp(8), 0, dp(14)); content.addView(intro);
+        intro.setTextColor(0xFFB8CBD8); intro.setPadding(0, dp(8), 0, dp(18)); content.addView(intro);
 
         Button capture = button("1. 画面読取を許可");
         capture.setOnClickListener(v -> requestCapture()); content.addView(capture);
@@ -58,12 +63,13 @@ public final class MainActivity extends Activity {
         });
         content.addView(overlay);
 
-        status = text("準備してください", 15); status.setTextColor(0xFF17364A);
-        status.setBackgroundColor(0xFFE7F1F4); status.setPadding(dp(12), dp(12), dp(12), dp(12));
+        status = text("準備してください", 15); status.setTextColor(0xFF8CEBFF);
+        status.setBackground(round(0xFF0D3855, 0xFF1B6F9A, 14)); status.setPadding(dp(14), dp(14), dp(14), dp(14));
         LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         statusLp.setMargins(0, dp(15), 0, dp(15)); content.addView(status, statusLp);
 
         TextView steps = text("使い方\n\n① 画面読取を許可します。\n② ユーザー補助設定で本アプリを有効にします。既に有効なら切り替え直す必要はありません。\n③ 操作パネルを表示し、野狐囲碁で対象の棋譜画面を開きます。\n④ パネルの「開始」を押します。パネルは盤面直下へ自動配置され、読取中も表示されます。\n⑤ 初期局面への巻き戻し後、一手ずつ自動読取します。\n⑥ 完了後、Downloadフォルダーへ［黒番］_vs_［白番］_yyyymmdd.sgfとして保存されます。\n\n「停止」は未完了のSGFを保存せず安全に中止します。終局メッセージを確認できない場合も保存しません。", 14);
+        steps.setTextColor(0xFFB8CBD8);
         content.addView(steps);
         Button exit = button("終了");
         exit.setOnClickListener(v -> { ReaderAccessibilityService.exitIfConnected(); CaptureService.shutdown(this); finishAndRemoveTask(); });
@@ -90,13 +96,20 @@ public final class MainActivity extends Activity {
 
     private Button button(String value) {
         Button b = new Button(this); b.setText(value); b.setAllCaps(false); b.setTextSize(15);
-        b.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
+        b.setTextColor(0xFFE7F7FF); b.setGravity(Gravity.CENTER_VERTICAL); b.setPadding(dp(16), 0, dp(16), 0);
+        b.setBackground(round(0xFF102B43, 0xFF1A587D, 14));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56));
+        lp.setMargins(0, dp(5), 0, dp(5)); b.setLayoutParams(lp);
         return b;
     }
     private TextView text(String value, float size) {
         TextView t = new TextView(this); t.setText(value); t.setTextSize(size); t.setLineSpacing(0, 1.15f); return t;
     }
     private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+    private GradientDrawable round(int fill, int stroke, int radius) {
+        GradientDrawable d = new GradientDrawable(); d.setColor(fill); d.setCornerRadius(dp(radius));
+        d.setStroke(dp(1), stroke); return d;
+    }
 
     public static void publishStatus(Context context, String text) {
         Intent i = new Intent(ACTION_STATUS).setPackage(context.getPackageName()).putExtra(EXTRA_STATUS, text);

@@ -19,6 +19,8 @@ FoxKifuScanner-source-*.zip
 *.keystore
 *.p12
 *.pem
+keystore.properties
+signing_key/
 
 # Test captures and private input files
 upload/

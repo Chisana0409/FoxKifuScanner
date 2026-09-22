@@ -366,7 +366,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(5), dp(4), dp(5), dp(4));
-        panel.setBackgroundColor(0xE6FFFFFF);
+        panel.setBackground(round(0xF2182B40, 0xFF35C7EA, 16));
 
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -382,7 +382,9 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         overlayStatus = new TextView(this);
         overlayStatus.setText("待機中");
         overlayStatus.setTextSize(11);
-        overlayStatus.setTextColor(0xFF17364A);
+        overlayStatus.setTextColor(0xFF8CEBFF);
+        overlayStatus.setGravity(Gravity.CENTER);
+        overlayStatus.setPadding(0, dp(2), 0, dp(3));
         panel.addView(row);
         panel.addView(overlayStatus);
 
@@ -412,11 +414,12 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     private Button smallButton(String text) {
         Button button = new Button(this);
         button.setText(text);
-        button.setTextSize(12);
+        button.setTextSize(12); button.setTextColor(0xFFE7F7FF);
         button.setAllCaps(false);
         button.setMinWidth(0);
         button.setMinimumWidth(0);
-        button.setPadding(dp(8), 0, dp(8), 0);
+        button.setPadding(dp(10), 0, dp(10), 0);
+        button.setBackground(round(text.equals("開始") ? 0xFF00BCD4 : text.equals("停止") ? 0xFFB3261E : 0xFF294257, 0xFF5B788E, 10));
         button.setLayoutParams(new LinearLayout.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT, dp(42)));
         return button;
@@ -427,9 +430,14 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         view.setText(text);
         view.setTextSize(22);
         view.setGravity(Gravity.CENTER);
-        view.setTextColor(0xFF0B6172);
+        view.setTextColor(0xFF8CEBFF);
         view.setLayoutParams(new LinearLayout.LayoutParams(dp(38), dp(42)));
         return view;
+    }
+
+    private android.graphics.drawable.GradientDrawable round(int fill, int stroke, int radius) {
+        android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
+        d.setColor(fill); d.setCornerRadius(dp(radius)); d.setStroke(dp(1), stroke); return d;
     }
 
     private final class DragHandler implements View.OnTouchListener {
