@@ -9,13 +9,20 @@ public final class SgfWriter {
     public static String build(GameMetadata meta, List<Move> moves, LocalDate date) {
         StringBuilder out = new StringBuilder(2048);
         out.append("(;GM[1]FF[4]CA[UTF-8]AP[FoxKifuScanner:1.3.2-shs20]SZ[19]");
-        out.append("DT[").append(date).append(']');
+        String gameDate = meta.date == null || meta.date.isBlank() ? date.toString() : meta.date;
+        out.append("DT[").append(escape(gameDate)).append(']');
+        out.append("EV[").append(escape(meta.event == null ? GameMetadata.DEFAULT_EVENT : meta.event)).append(']');
         out.append("PB[").append(escape(meta.blackName)).append(']');
         if (!meta.blackRank.isBlank()) out.append("BR[").append(escape(meta.blackRank)).append(']');
         out.append("PW[").append(escape(meta.whiteName)).append(']');
         if (!meta.whiteRank.isBlank()) out.append("WR[").append(escape(meta.whiteRank)).append(']');
-        out.append("PC[").append(escape(meta.place.isBlank() ? "野狐囲碁" : meta.place)).append(']');
-        out.append("RU[Chinese]");
+        out.append("PC[").append(escape(meta.place == null || meta.place.isBlank()
+                ? GameMetadata.DEFAULT_PLACE : meta.place)).append(']');
+        out.append("RU[").append(escape(meta.rule == null || meta.rule.isBlank()
+                ? GameMetadata.DEFAULT_RULE : meta.rule)).append(']');
+        String komi = meta.komi == null || meta.komi.isBlank()
+                ? ("互先".equals(meta.handicapText) ? "7.5" : "0") : meta.komi;
+        out.append("KM[").append(escape(komi)).append(']');
         if (meta.handicap > 1) out.append("HA[").append(meta.handicap).append(']');
         appendSetup(out, "AB", meta.initialPosition, BoardState.BLACK);
         appendSetup(out, "AW", meta.initialPosition, BoardState.WHITE);
@@ -37,6 +44,7 @@ public final class SgfWriter {
     }
 
     static String escape(String value) {
+        if (value == null) return "";
         return value.replace("\\", "\\\\").replace("]", "\\]").replace("\r", " ").replace("\n", " ");
     }
 }

@@ -19,9 +19,14 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
 
 import java.time.LocalDate;
 import java.util.ArrayList;
@@ -76,6 +81,8 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     private View overlay;
     private TextView overlayStatus;
     private WindowManager.LayoutParams overlayParams;
+    private View metadataEditor;
+    private WindowManager.LayoutParams metadataEditorParams;
     private boolean overlayDocked;
     private int overlayOriginalX;
     private int overlayOriginalY;
@@ -605,17 +612,249 @@ public final class ReaderAccessibilityService extends AccessibilityService {
                                    ScanMetrics metrics) throws Exception {
         checkCancelled();
         long saveStarted = metrics.mark();
+        publish("対局情報を確認・編集してください");
+        GameMetadata edited = awaitMetadataEditor(meta);
+        checkCancelled();
         publish("SGFを保存中…");
         LocalDate date = LocalDate.now();
-        String sgf = SgfWriter.build(meta, moves, date);
+        String sgf = SgfWriter.build(edited, moves, date);
         checkCancelled();
-        SgfStore.save(this, meta, sgf, date);
+        SgfStore.save(this, edited, sgf, date);
         metrics.addPhase("save", saveStarted);
         metrics.finishSuccess(moves.size());
-        publish("保存完了：Download/" + safeName(meta.blackName) + "_vs_"
-                + safeName(meta.whiteName) + "_" + date.toString().replace("-", "")
+        publish("保存完了：Download/" + safeName(edited.blackName) + "_vs_"
+                + safeName(edited.whiteName) + "_" + date.toString().replace("-", "")
                 + ".sgf（" + moves.size() + "手／"
                 + String.format(java.util.Locale.ROOT, "%.2f", metrics.elapsedSeconds()) + "秒）");
+    }
+
+    private GameMetadata awaitMetadataEditor(GameMetadata source) throws Exception {
+        CompletableFuture<GameMetadata> result = new CompletableFuture<>();
+        main.post(() -> showMetadataEditor(source, result));
+        while (true) {
+            checkCancelled();
+            try {
+                GameMetadata edited = result.get(250, TimeUnit.MILLISECONDS);
+                if (edited == null) throw new CancellationException("対局情報の編集をキャンセルしました");
+                return edited;
+            } catch (TimeoutException ignored) {
+                // Keep cancellation responsive while the user is editing.
+            }
+        }
+    }
+
+    private void showMetadataEditor(GameMetadata source, CompletableFuture<GameMetadata> result) {
+        if (metadataEditor != null) return;
+        GameMetadata draft = copyMetadata(source);
+        draft.date = textOrDefault(draft.date, LocalDate.now().toString());
+        draft.event = textOrDefault(draft.event, GameMetadata.DEFAULT_EVENT);
+        draft.place = textOrDefault(draft.place, GameMetadata.DEFAULT_PLACE);
+        draft.rule = textOrDefault(draft.rule, GameMetadata.DEFAULT_RULE);
+        if (draft.komi == null || draft.komi.isBlank()) draft.applyDefaultKomi();
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(16), dp(14), dp(16), dp(12));
+        panel.setBackground(round(0xF2182B40, 0xFF35C7EA, 16));
+        panel.setFocusableInTouchMode(true);
+
+        TextView title = new TextView(this);
+        title.setText("対局情報の確認・編集");
+        title.setTextSize(19);
+        title.setTextColor(0xFFE7F7FF);
+        title.setTypeface(null, android.graphics.Typeface.BOLD);
+        panel.addView(title, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, dp(38)));
+
+        TextView hint = new TextView(this);
+        hint.setText("読み取り結果を確認し、必要に応じて修正してから保存してください。");
+        hint.setTextSize(12);
+        hint.setTextColor(0xFFB8CBD8);
+        hint.setPadding(0, 0, 0, dp(6));
+        panel.addView(hint);
+
+        LinearLayout fields = new LinearLayout(this);
+        fields.setOrientation(LinearLayout.VERTICAL);
+        EditText date = addMetadataField(fields, "*対局日時", draft.date, InputType.TYPE_CLASS_DATETIME);
+        EditText event = addMetadataField(fields, "大会名", draft.event, InputType.TYPE_CLASS_TEXT);
+        EditText place = addMetadataField(fields, "対局場所", draft.place, InputType.TYPE_CLASS_TEXT);
+        EditText blackName = addMetadataField(fields, "*黒番名", draft.blackName, InputType.TYPE_CLASS_TEXT);
+        EditText blackRank = addMetadataField(fields, "黒番級位", draft.blackRank, InputType.TYPE_CLASS_TEXT);
+        EditText whiteName = addMetadataField(fields, "*白番名", draft.whiteName, InputType.TYPE_CLASS_TEXT);
+        EditText whiteRank = addMetadataField(fields, "白番級位", draft.whiteRank, InputType.TYPE_CLASS_TEXT);
+        EditText rule = addMetadataField(fields, "*ルール", draft.rule, InputType.TYPE_CLASS_TEXT);
+        EditText komi = addMetadataField(fields, "*コミ", draft.komi, InputType.TYPE_CLASS_NUMBER
+                | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
+        EditText resultText = addMetadataField(fields, "*勝敗", draft.result, InputType.TYPE_CLASS_TEXT);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.addView(fields, new ScrollView.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT));
+        panel.addView(scroll, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        TextView validation = new TextView(this);
+        validation.setTextSize(12);
+        validation.setTextColor(0xFFFFB4AB);
+        validation.setPadding(0, dp(5), 0, dp(3));
+        panel.addView(validation, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, dp(32)));
+
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        Button cancel = smallButton("キャンセル");
+        Button save = smallButton("保存");
+        save.setBackground(round(0xFF00BCD4, 0xFF5B788E, 10));
+        buttons.addView(cancel);
+        buttons.addView(save);
+        panel.addView(buttons, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, dp(48)));
+
+        TextWatcher watcher = new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                updateMetadataValidation(save, validation, draft, date, event, place,
+                        blackName, blackRank, whiteName, whiteRank, rule, komi, resultText);
+            }
+            @Override public void afterTextChanged(Editable s) {}
+        };
+        EditText[] inputs = {date, event, place, blackName, blackRank, whiteName,
+                whiteRank, rule, komi, resultText};
+        for (EditText input : inputs) input.addTextChangedListener(watcher);
+
+        cancel.setOnClickListener(v -> {
+            closeMetadataEditor();
+            result.complete(null);
+        });
+        save.setOnClickListener(v -> {
+            updateDraft(draft, date, event, place, blackName, blackRank, whiteName,
+                    whiteRank, rule, komi, resultText);
+            String error = GameMetadataValidator.validate(draft);
+            if (!error.isBlank()) {
+                validation.setText(error);
+                return;
+            }
+            closeMetadataEditor();
+            result.complete(draft);
+        });
+
+        metadataEditor = panel;
+        metadataEditorParams = new WindowManager.LayoutParams(
+                screenWidthPixels(0.8f), screenHeightPixels(0.8f),
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                android.graphics.PixelFormat.TRANSLUCENT);
+        metadataEditorParams.gravity = Gravity.CENTER;
+        metadataEditorParams.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE;
+        if (overlay != null) overlay.setVisibility(View.INVISIBLE);
+        try {
+            windowManager.addView(metadataEditor, metadataEditorParams);
+            panel.requestFocus();
+            updateMetadataValidation(save, validation, draft, date, event, place,
+                    blackName, blackRank, whiteName, whiteRank, rule, komi, resultText);
+        } catch (Throwable error) {
+            metadataEditor = null;
+            metadataEditorParams = null;
+            if (overlay != null) overlay.setVisibility(View.VISIBLE);
+            result.completeExceptionally(error);
+        }
+    }
+
+    private EditText addMetadataField(LinearLayout parent, String label, String value, int inputType) {
+        TextView caption = new TextView(this);
+        caption.setText(label);
+        caption.setTextSize(12);
+        caption.setTextColor(0xFF8CEBFF);
+        caption.setPadding(0, dp(3), 0, dp(1));
+        parent.addView(caption, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, dp(22)));
+        EditText input = new EditText(this);
+        input.setText(value == null ? "" : value);
+        input.setTextSize(15);
+        input.setTextColor(0xFFE7F7FF);
+        input.setSingleLine(true);
+        input.setInputType(inputType);
+        input.setPadding(dp(10), 0, dp(10), 0);
+        input.setBackground(round(0xFF0D3855, 0xFF1B6F9A, 8));
+        parent.addView(input, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, dp(40)));
+        return input;
+    }
+
+    private void updateMetadataValidation(Button save, TextView validation, GameMetadata draft,
+                                          EditText date, EditText event, EditText place,
+                                          EditText blackName, EditText blackRank,
+                                          EditText whiteName, EditText whiteRank,
+                                          EditText rule, EditText komi, EditText result) {
+        updateDraft(draft, date, event, place, blackName, blackRank, whiteName, whiteRank,
+                rule, komi, result);
+        String error = GameMetadataValidator.validate(draft);
+        save.setEnabled(error.isBlank());
+        save.setAlpha(error.isBlank() ? 1f : 0.45f);
+        validation.setText(error);
+    }
+
+    private void updateDraft(GameMetadata draft, EditText date, EditText event, EditText place,
+                             EditText blackName, EditText blackRank, EditText whiteName,
+                             EditText whiteRank, EditText rule, EditText komi, EditText result) {
+        draft.date = date.getText().toString().trim();
+        draft.event = event.getText().toString();
+        draft.place = place.getText().toString();
+        draft.blackName = blackName.getText().toString();
+        draft.blackRank = blackRank.getText().toString();
+        draft.whiteName = whiteName.getText().toString();
+        draft.whiteRank = whiteRank.getText().toString();
+        draft.rule = rule.getText().toString();
+        draft.komi = komi.getText().toString().trim();
+        draft.result = result.getText().toString().trim();
+    }
+
+    private GameMetadata copyMetadata(GameMetadata source) {
+        GameMetadata copy = new GameMetadata();
+        copy.blackName = source.blackName;
+        copy.whiteName = source.whiteName;
+        copy.blackRank = source.blackRank;
+        copy.whiteRank = source.whiteRank;
+        copy.result = source.result;
+        copy.handicapText = source.handicapText;
+        copy.date = source.date;
+        copy.event = source.event;
+        copy.place = source.place;
+        copy.rule = source.rule;
+        copy.komi = source.komi;
+        copy.handicap = source.handicap;
+        copy.initialPosition = source.initialPosition;
+        return copy;
+    }
+
+    private String textOrDefault(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private int screenWidthPixels(float ratio) {
+        android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
+        windowManager.getDefaultDisplay().getRealMetrics(metrics);
+        return Math.max(1, Math.round(metrics.widthPixels * ratio));
+    }
+
+    private int screenHeightPixels(float ratio) {
+        android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
+        windowManager.getDefaultDisplay().getRealMetrics(metrics);
+        return Math.max(1, Math.round(metrics.heightPixels * ratio));
+    }
+
+    private void closeMetadataEditor() {
+        if (metadataEditor != null) {
+            try {
+                windowManager.removeView(metadataEditor);
+            } catch (Exception ignored) {
+            }
+        }
+        metadataEditor = null;
+        metadataEditorParams = null;
+        if (overlay != null) overlay.setVisibility(View.VISIBLE);
     }
 
     private CompletableFuture<GameMetadata> startMetadataEnhancement(
@@ -680,6 +919,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             resolved.handicap = scanMetadata.handicap;
             resolved.handicapText = scanMetadata.handicapText;
         }
+        resolved.applyDefaultKomi();
         publish("確定情報：黒 " + resolved.blackDisplay() + "／白 "
                 + resolved.whiteDisplay()
                 + (resolved.result.isBlank() ? "" : "／結果 " + resolved.result));
@@ -748,6 +988,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         if (black >= 2 && black <= 9 && BoardAnalyzer.isInitial(state, black)) {
             meta.handicap = black;
             meta.handicapText = black + "子";
+            meta.applyDefaultKomi();
             return true;
         }
         return false;
@@ -2328,6 +2569,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     private void exitReader() {
         cancelled = true;
         closeActiveSliderSession();
+        closeMetadataEditor();
         if (overlay != null) {
             try {
                 windowManager.removeView(overlay);
@@ -2356,6 +2598,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             } catch (Exception ignored) {
             }
         }
+        closeMetadataEditor();
         overlay = null;
         instance = null;
         super.onDestroy();

@@ -164,9 +164,11 @@ public final class MetadataReader {
         meta.whiteRank = white.rank();
         meta.handicapText = parseHandicap(all);
         meta.handicap = handicapCount(meta.handicapText);
+        meta.applyDefaultKomi();
         meta.result = parseResult(center);
         if (meta.result.isBlank()) meta.result = parseResult(all);
-        meta.place = "野狐囲碁";
+        meta.place = GameMetadata.DEFAULT_PLACE;
+        meta.rule = parseRule(all);
         return meta;
     }
 
@@ -216,6 +218,14 @@ public final class MetadataReader {
     private static int handicapCount(String text) {
         Matcher matcher = Pattern.compile("([2-9])子").matcher(normalizeDigits(text));
         return matcher.find() ? Integer.parseInt(matcher.group(1)) : 0;
+    }
+
+    private static String parseRule(String source) {
+        String text = normalize(source).replaceAll("\\s+", "").toLowerCase(Locale.ROOT);
+        if (text.contains("日本") || text.contains("japanese")) return "Japanese";
+        if (text.contains("韓国") || text.contains("korean")) return "Korean";
+        if (text.contains("中国") || text.contains("chinese")) return "Chinese";
+        return GameMetadata.DEFAULT_RULE;
     }
 
     static String parseResult(String source) {
