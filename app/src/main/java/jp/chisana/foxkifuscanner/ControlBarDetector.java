@@ -54,7 +54,16 @@ public final class ControlBarDetector {
         if (bestY < 0 || bestRun < requiredRun) {
             throw new IllegalStateException("画面最下部の手数操作バーを検出できません");
         }
-        return new Result(bestY, safeTop, safeBottom, bestRun);
+        return new Result(touchY(bestY, homeIndicator), safeTop, safeBottom, bestRun);
+    }
+
+    /**
+     * Moves the gesture into the replay row's upper hit area when Android gesture navigation
+     * reserves the pixels immediately above the visible home indicator.
+     */
+    static int touchY(int visualY, HomeIndicatorDetector.Result homeIndicator) {
+        if (homeIndicator == null) return visualY;
+        return Math.min(visualY, homeIndicator.top() - 28);
     }
 
     public static int safeTop(int screenHeight, BoardAnalyzer.Region board) {

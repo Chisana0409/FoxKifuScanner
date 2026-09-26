@@ -22,6 +22,12 @@ public class HomeIndicatorDetectorTest {
         assertNull(HomeIndicatorDetector.detect(pixels));
     }
 
+    @Test public void shiftsReplayTouchAboveGestureNavigationHitArea() {
+        HomeIndicatorDetector.Result indicator = new HomeIndicatorDetector.Result(1267, 1272, 400, 110);
+        assertEquals(1239, ControlBarDetector.touchY(1253, indicator));
+        assertEquals(1253, ControlBarDetector.touchY(1253, null));
+    }
+
     private static BoardAnalyzer.Pixels pixels(int width, int height, Pixel pixel) {
         return new BoardAnalyzer.Pixels() {
             public int width() { return width; }
