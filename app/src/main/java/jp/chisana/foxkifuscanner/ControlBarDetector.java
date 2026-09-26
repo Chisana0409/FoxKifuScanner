@@ -2,7 +2,7 @@ package jp.chisana.foxkifuscanner;
 
 /** Finds the replay controls only inside the protected strip at the screen bottom. */
 public final class ControlBarDetector {
-    public record Result(int y, int safeTop, int safeBottom, int trackRun) {}
+    public record Result(int y, int touchY, int safeTop, int safeBottom, int trackRun) {}
     public record Thumb(int centerX, int score) {}
 
     private ControlBarDetector() {}
@@ -54,7 +54,7 @@ public final class ControlBarDetector {
         if (bestY < 0 || bestRun < requiredRun) {
             throw new IllegalStateException("画面最下部の手数操作バーを検出できません");
         }
-        return new Result(touchY(bestY, homeIndicator), safeTop, safeBottom, bestRun);
+        return new Result(bestY, touchY(bestY, homeIndicator, height), safeTop, safeBottom, bestRun);
     }
 
     /**
@@ -62,8 +62,15 @@ public final class ControlBarDetector {
      * reserves the pixels immediately above the visible home indicator.
      */
     static int touchY(int visualY, HomeIndicatorDetector.Result homeIndicator) {
+        return touchY(visualY, homeIndicator, 1280);
+    }
+
+    static int touchY(int visualY, HomeIndicatorDetector.Result homeIndicator, int screenHeight) {
         if (homeIndicator == null) return visualY;
-        return Math.min(visualY, homeIndicator.top() - 28);
+        // Tap the upper edge of the knob rather than the center line. Gesture navigation on
+        // the tablet reserves a broad band immediately above the visible home indicator.
+        int knobTopOffset = Math.max(24, (int) Math.round(screenHeight * 0.020));
+        return Math.min(visualY - knobTopOffset, homeIndicator.top() - 40);
     }
 
     public static int safeTop(int screenHeight, BoardAnalyzer.Region board) {

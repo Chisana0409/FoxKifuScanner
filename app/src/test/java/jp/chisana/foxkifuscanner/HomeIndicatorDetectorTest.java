@@ -24,7 +24,7 @@ public class HomeIndicatorDetectorTest {
 
     @Test public void shiftsReplayTouchAboveGestureNavigationHitArea() {
         HomeIndicatorDetector.Result indicator = new HomeIndicatorDetector.Result(1267, 1272, 400, 110);
-        assertEquals(1239, ControlBarDetector.touchY(1253, indicator));
+        assertEquals(1227, ControlBarDetector.touchY(1253, indicator, 1280));
         assertEquals(1253, ControlBarDetector.touchY(1253, null));
     }
 

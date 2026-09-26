@@ -1401,7 +1401,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
                     return null;
                 }
 
-                shsFramePixels.bind(bitmap, geometry.board, Math.round(geometry.sliderLeft.y));
+                shsFramePixels.bind(bitmap, geometry.board, Math.round(geometry.visualControlY()));
                 PointF thumb = null;
                 if (session.mode() == SliderMode.TEXT) {
                     try {
