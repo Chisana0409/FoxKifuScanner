@@ -11,17 +11,20 @@ public final class ScreenGeometry {
     public final PointF sliderLeft;
     public final PointF sliderRight;
     private final int screenWidth;
+    private final int screenHeight;
     private final float visualControlY;
     private final int safeTop;
     private final int safeBottom;
 
     private ScreenGeometry(BoardAnalyzer.Region board, PointF back, PointF forward,
                            PointF sliderLeft, PointF sliderRight, int screenWidth,
+                           int screenHeight,
                            float visualControlY,
                            int safeTop, int safeBottom) {
         this.board = board; this.back = back; this.forward = forward;
         this.sliderLeft = sliderLeft; this.sliderRight = sliderRight;
-        this.screenWidth = screenWidth; this.visualControlY = visualControlY;
+        this.screenWidth = screenWidth; this.screenHeight = screenHeight;
+        this.visualControlY = visualControlY;
         this.safeTop = safeTop; this.safeBottom = safeBottom;
     }
 
@@ -33,7 +36,7 @@ public final class ScreenGeometry {
         ScreenGeometry geometry = new ScreenGeometry(board,
                 new PointF(w * 0.557f, touchY), new PointF(w * 0.660f, touchY),
                 new PointF(w * 0.070f, touchY), new PointF(w * 0.470f, touchY),
-                w, visualY, control.safeTop(), control.safeBottom());
+                w, bitmap.getHeight(), visualY, control.safeTop(), control.safeBottom());
         geometry.requireSafe(geometry.back);
         geometry.requireSafe(geometry.forward);
         geometry.requireSafe(geometry.sliderLeft);
@@ -98,8 +101,20 @@ public final class ScreenGeometry {
         return visualControlY;
     }
 
+    int screenHeight() {
+        return screenHeight;
+    }
+
+    boolean usesHomeIndicatorAdjustedTouch() {
+        return sliderLeft.y < visualControlY - 1.0f;
+    }
+
     int safeTopY() {
         return safeTop;
+    }
+
+    int safeBottomY() {
+        return safeBottom;
     }
 
     public double sliderProgressForX(float x) {

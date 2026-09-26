@@ -56,7 +56,7 @@ public final class BoardAnalyzer {
         return new Detection(board, new BoardState(cells), certainty / 361.0);
     }
 
-    private static Region findWoodBoard(Pixels p) {
+    static Region findWoodBoard(Pixels p) {
         int w = p.width(), h = p.height();
         int startY = (int) (h * 0.10), endY = (int) (h * 0.78);
         boolean[] rows = new boolean[h];
@@ -70,13 +70,20 @@ public final class BoardAnalyzer {
             rows[y] = ok;
             if (y + 1 < h) rows[y + 1] = ok;
         }
-        int bestStart = -1, bestEnd = -1, run = -1;
+        int bestStart = -1, bestEnd = -1, run = -1, lastWarm = -1;
+        int allowedGap = Math.max(8, (int) Math.round(w * 0.04));
         for (int y = startY; y <= endY; y++) {
             if (y < endY && rows[y]) {
                 if (run < 0) run = y;
-            } else if (run >= 0) {
-                if (bestStart < 0 || y - run > bestEnd - bestStart) { bestStart = run; bestEnd = y; }
+                lastWarm = y;
+            } else if (run >= 0 && (y == endY || y - lastWarm > allowedGap)) {
+                int candidateEnd = lastWarm + 1;
+                if (bestStart < 0 || candidateEnd - run > bestEnd - bestStart) {
+                    bestStart = run;
+                    bestEnd = candidateEnd;
+                }
                 run = -1;
+                lastWarm = -1;
             }
         }
         if (bestStart < 0 || bestEnd - bestStart < w * 0.62) return fallbackBoard(p);
@@ -95,7 +102,11 @@ public final class BoardAnalyzer {
         int left = 0, right = w;
         while (left < w && !cols[left]) left++;
         while (right > left && !cols[right - 1]) right--;
-        int side = Math.min(right - left, bestEnd - bestStart);
+        int horizontalSpan = right - left;
+        int verticalSpan = bestEnd - bestStart;
+        int side = Math.abs(horizontalSpan - verticalSpan) <= w * 0.10
+                ? Math.max(horizontalSpan, verticalSpan)
+                : Math.min(horizontalSpan, verticalSpan);
         if (side < w * 0.62) return fallbackBoard(p);
         int cx = (left + right) / 2, cy = (bestStart + bestEnd) / 2;
         return new Region(Math.max(0, cx - side / 2), Math.max(0, cy - side / 2),
