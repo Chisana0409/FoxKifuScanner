@@ -98,6 +98,10 @@ public final class ScreenGeometry {
         return visualControlY;
     }
 
+    int safeTopY() {
+        return safeTop;
+    }
+
     public double sliderProgressForX(float x) {
         double progress = (x - sliderLeft.x) / sliderTrackWidth();
         return Math.max(0.0, Math.min(1.0, progress));

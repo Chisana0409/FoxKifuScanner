@@ -77,6 +77,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     private volatile boolean running;
     private volatile long terminalSignalUntil;
     private volatile int activeMoveCount;
+    private volatile String targetPackageName = "";
     private WindowManager windowManager;
     private View overlay;
     private TextView overlayStatus;
@@ -92,6 +93,9 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             if (!bitmap.isRecycled()) bitmap.recycle();
         }
     }
+
+    private record SliderTouchProbe(Frame frame, boolean sliderMoved,
+                                    boolean homeBarReacted) {}
 
     private record LightFrame(Bitmap bitmap, BoardFrameFingerprint fingerprint,
                               double sliderProgress, long sequence) {
@@ -272,6 +276,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             CharSequence packageValue = source.getPackageName();
             String packageName = packageValue == null ? "" : packageValue.toString();
             if (packageName.isBlank() || getPackageName().equals(packageName)) return;
+            targetPackageName = packageName;
 
             Rect bounds = new Rect();
             source.getBoundsInScreen(bounds);
@@ -482,6 +487,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         }
         cancelled = false;
         running = true;
+        targetPackageName = "";
         terminalSignalUntil = 0;
         latestRangeSliderEvent.set(null);
         latestTextSliderEvent.set(null);
@@ -943,13 +949,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         if (isInitialOrInfer(frame.detection().state(), meta)) return frame;
 
         publish("手数バーのツマミを左端へ移動しています…");
-        for (int attempt = 0; attempt < 2 && !geometry.isSliderAtLeft(frame.bitmap()); attempt++) {
-            BoardState beforeDrag = frame.detection().state();
-            PointF thumb = geometry.sliderThumb(frame.bitmap());
-            frame.recycle();
-            gestureSwipe(geometry, thumb, geometry.sliderLeft, 420);
-            frame = awaitStable(geometry, beforeDrag, 3000);
-        }
+        frame = rewindSliderWithBinaryTouchSearch(geometry, frame);
         if (!geometry.isSliderAtLeft(frame.bitmap())) {
             frame.recycle();
             throw new IllegalStateException("手数操作バーのツマミを左端へ移動できません");
@@ -976,6 +976,133 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         }
         frame.recycle();
         throw new IllegalStateException("初期局面への巻き戻しが上限を超えました");
+    }
+
+    /**
+     * Finds the highest Y that still reaches the slider. The current operation Y is the known
+     * slider-hit bound; safeTop is the known no-control bound. Every successful probe is restored
+     * to the original thumb position before the next binary-search step.
+     */
+    private Frame rewindSliderWithBinaryTouchSearch(ScreenGeometry geometry, Frame frame)
+            throws Exception {
+        if (geometry.isSliderAtLeft(frame.bitmap())) return frame;
+
+        final int initialY = Math.round(geometry.sliderLeft.y);
+        final int noControlY = geometry.safeTopY();
+        final float originalX = geometry.sliderThumb(frame.bitmap()).x;
+        int hitY = initialY;
+        int missY = noControlY;
+        if (missY >= hitY) {
+            throw new IllegalStateException("手数バーの操作Y座標を探索できません");
+        }
+
+        SliderTouchProbe baseline = swipeSliderAtY(geometry, frame, hitY, geometry.sliderLeft.x);
+        frame = baseline.frame();
+        if (!baseline.sliderMoved() || baseline.homeBarReacted()) {
+            frame.recycle();
+            throw new IllegalStateException("現在の操作Y座標でスライダに触れられません");
+        }
+        if (geometry.isSliderAtLeft(frame.bitmap())) return frame;
+        frame = restoreSliderAtY(geometry, frame, hitY, originalX);
+
+        while (hitY - missY > 1) {
+            int candidateY = missY + (hitY - missY) / 2;
+            SliderTouchProbe probe = swipeSliderAtY(
+                    geometry, frame, candidateY, geometry.sliderLeft.x);
+            frame = probe.frame();
+            if (probe.sliderMoved() && !probe.homeBarReacted()) {
+                hitY = candidateY;
+                if (geometry.isSliderAtLeft(frame.bitmap())) return frame;
+                frame = restoreSliderAtY(geometry, frame, candidateY, originalX);
+            } else {
+                missY = candidateY;
+            }
+        }
+
+        publish("スライダ操作位置を調整しました（Y=" + hitY + "）");
+        SliderTouchProbe finalProbe = swipeSliderAtY(
+                geometry, frame, hitY, geometry.sliderLeft.x);
+        frame = finalProbe.frame();
+        if (!finalProbe.sliderMoved() || finalProbe.homeBarReacted()) {
+            frame.recycle();
+            throw new IllegalStateException("二分探索したY座標でスライダを操作できません");
+        }
+        return frame;
+    }
+
+    private SliderTouchProbe swipeSliderAtY(ScreenGeometry geometry, Frame frame,
+                                             int y, float targetX) throws Exception {
+        double beforeProgress = geometry.sliderProgress(frame.bitmap());
+        BoardState before = frame.detection().state();
+        PointF thumb = geometry.sliderThumb(frame.bitmap());
+        PointF from = pointAtY(geometry, thumb.x, y);
+        PointF to = pointAtY(geometry, targetX, y);
+        frame.recycle();
+        gestureSwipe(geometry, from, to, 420);
+        boolean homeBarReacted = !targetAppIsForeground();
+        if (homeBarReacted) {
+            performGlobalBack();
+            Thread.sleep(250);
+            if (!targetAppIsForeground()) {
+                throw new IllegalStateException("ホームバー反応後に野狐の画面へ復帰できません");
+            }
+        }
+        Frame after = awaitStable(geometry, before, 3000);
+        homeBarReacted = homeBarReacted || !targetAppIsForeground();
+        if (homeBarReacted && !targetAppIsForeground()) {
+            throw new IllegalStateException("ホームバー反応後に野狐の画面へ復帰できません");
+        }
+        double afterProgress = geometry.sliderProgress(after.bitmap());
+        boolean moved = !homeBarReacted && (geometry.isSliderAtLeft(after.bitmap())
+                || progressMovedTowardLeft(beforeProgress, afterProgress));
+        return new SliderTouchProbe(after, moved, homeBarReacted);
+    }
+
+    private Frame restoreSliderAtY(ScreenGeometry geometry, Frame frame,
+                                   int y, float targetX) throws Exception {
+        SliderTouchProbe restored = swipeSliderAtY(geometry, frame, y, targetX);
+        if (!restored.sliderMoved() || restored.homeBarReacted()) {
+            restored.frame().recycle();
+            throw new IllegalStateException("スライダ操作位置の探索状態を復元できません");
+        }
+        return restored.frame();
+    }
+
+    private static boolean progressMovedTowardLeft(double before, double after) {
+        return before >= 0 && after >= 0 && before - after > 0.008;
+    }
+
+    private static PointF pointAtY(ScreenGeometry geometry, float x, int y) {
+        PointF point = new PointF(x, y);
+        geometry.requireSafe(point);
+        return point;
+    }
+
+    private boolean targetAppIsForeground() {
+        String target = targetPackageName;
+        if (target == null || target.isBlank()) return true;
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows != null) {
+                for (AccessibilityWindowInfo window : windows) {
+                    try {
+                        AccessibilityNodeInfo root = window.getRoot();
+                        if (root == null) continue;
+                        try {
+                            CharSequence packageName = root.getPackageName();
+                            if (packageName != null && target.contentEquals(packageName)) return true;
+                        } finally {
+                            root.recycle();
+                        }
+                    } finally {
+                        window.recycle();
+                    }
+                }
+            }
+            return false;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private boolean isInitialOrInfer(BoardState state, GameMetadata meta) {
