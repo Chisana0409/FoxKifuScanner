@@ -279,7 +279,14 @@ public final class MetadataReader {
     }
 
     private static String winner(String value) {
-        return value.equals("黒") ? "B" : "W";
+        if (value == null || value.isBlank()) return "";
+        String text = value.replaceAll("\\s+", "");
+        Matcher resultColor = Pattern.compile("(黒|白)(?:(?!黒|白).){0,24}勝").matcher(text);
+        if (resultColor.find()) return "黒".equals(resultColor.group(1)) ? "B" : "W";
+        boolean black = text.contains("黒");
+        boolean white = text.contains("白");
+        if (black == white) return "";
+        return black ? "B" : "W";
     }
 
     private static String formatAmount(double amount) {

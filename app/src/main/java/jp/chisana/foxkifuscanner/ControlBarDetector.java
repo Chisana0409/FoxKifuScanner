@@ -11,7 +11,14 @@ public final class ControlBarDetector {
         int width = pixels.width();
         int height = pixels.height();
         int safeTop = safeTop(height, board);
-        int safeBottom = Math.min(height - 1, (int) Math.round(height * 0.985));
+        HomeIndicatorDetector.Result homeIndicator = HomeIndicatorDetector.detect(pixels);
+        // Keep a small fallback exclusion even when the system bar is not visible in the
+        // screenshot. This covers cropped screenshots and vendor-specific three-button bars.
+        int fallbackBottom = height - Math.max(16, (int) Math.round(height * 0.018));
+        int safeBottom = Math.min(height - 1, fallbackBottom);
+        if (homeIndicator != null) {
+            safeBottom = Math.min(safeBottom, homeIndicator.top() - 8);
+        }
         if (safeTop >= safeBottom) {
             throw new IllegalStateException("手数操作バーの安全領域を確保できません");
         }
