@@ -22,31 +22,37 @@ public final class HomeIndicatorDetector {
         Result best = null;
         for (int y = y0; y < height; y++) {
             int runStart = -1;
+            int runKind = 0;
             for (int x = 0; x <= width; x++) {
-                boolean bright = x < width && isIndicatorPixel(pixels.argb(x, y));
-                if (bright && runStart < 0) runStart = x;
-                if ((!bright || x == width) && runStart >= 0) {
+                int kind = x < width ? indicatorKind(pixels.argb(x, y)) : 0;
+                if (kind != 0 && runStart < 0) {
+                    runStart = x;
+                    runKind = kind;
+                } else if (kind != runKind) {
                     int runEnd = x;
                     int runWidth = runEnd - runStart;
                     int center = (runStart + runEnd - 1) / 2;
-                    if (runWidth >= minRun && runWidth <= maxRun
+                    if (runStart >= 0 && runWidth >= minRun && runWidth <= maxRun
                             && center >= width * 0.25 && center <= width * 0.75
                             && (best == null || runWidth > best.width())) {
                         best = new Result(y, Math.min(height, y + 1), center, runWidth);
                     }
-                    runStart = -1;
+                    runStart = kind == 0 ? -1 : x;
+                    runKind = kind;
                 }
             }
         }
         return best;
     }
 
-    private static boolean isIndicatorPixel(int color) {
+    private static int indicatorKind(int color) {
         int r = (color >> 16) & 255;
         int g = (color >> 8) & 255;
         int b = color & 255;
         int min = Math.min(r, Math.min(g, b));
         int max = Math.max(r, Math.max(g, b));
-        return min >= 238 && max - min <= 24;
+        if (min >= 238 && max - min <= 24) return 1;
+        if (max <= 140 && max - min <= 24) return 2;
+        return 0;
     }
 }

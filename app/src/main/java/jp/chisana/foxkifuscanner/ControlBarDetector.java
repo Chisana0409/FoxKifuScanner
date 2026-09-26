@@ -1,8 +1,10 @@
 package jp.chisana.foxkifuscanner;
 
+import android.util.Log;
+
 /** Finds the replay controls only inside the protected strip at the screen bottom. */
 public final class ControlBarDetector {
-    public record Result(int y, int safeTop, int safeBottom, int trackRun) {}
+    public record Result(int y, int touchY, int safeTop, int safeBottom, int trackRun) {}
     public record Thumb(int centerX, int score) {}
 
     private ControlBarDetector() {}
@@ -52,9 +54,31 @@ public final class ControlBarDetector {
 
         int requiredRun = Math.max(48, (int) Math.round(width * 0.10));
         if (bestY < 0 || bestRun < requiredRun) {
+            Log.w("FoxKifuControl", "replay bar not found width=" + width + " height=" + height
+                    + " safeTop=" + safeTop + " safeBottom=" + safeBottom
+                    + " home=" + homeIndicator + " bestY=" + bestY + " bestRun=" + bestRun
+                    + " required=" + requiredRun);
             throw new IllegalStateException("画面最下部の手数操作バーを検出できません");
         }
-        return new Result(bestY, safeTop, safeBottom, bestRun);
+        return new Result(bestY, touchY(bestY, homeIndicator, height), safeTop, safeBottom, bestRun);
+    }
+
+    /**
+     * Moves the gesture into the replay row's upper hit area when Android gesture navigation
+     * reserves the pixels immediately above the visible home indicator.
+     */
+    static int touchY(int visualY, HomeIndicatorDetector.Result homeIndicator) {
+        return touchY(visualY, homeIndicator, 1280);
+    }
+
+    static int touchY(int visualY, HomeIndicatorDetector.Result homeIndicator, int screenHeight) {
+        if (homeIndicator == null) return visualY;
+        // On the HT10-PRO (800x1280), direct accessibility-coordinate probing found that
+        // y=1212 misses the slider while y=1213 moves it without triggering the home bar.
+        // Keep a small margin above that measured boundary for dispatchGesture variability.
+        int measuredSafeGap = Math.max(48, (int) Math.round(screenHeight * 48.0 / 1280.0));
+        int visualGap = Math.max(32, (int) Math.round(screenHeight * 32.0 / 1280.0));
+        return Math.min(visualY - visualGap, homeIndicator.top() - measuredSafeGap);
     }
 
     public static int safeTop(int screenHeight, BoardAnalyzer.Region board) {

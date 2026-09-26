@@ -11,6 +11,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.View;
@@ -42,11 +43,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class ReaderAccessibilityService extends AccessibilityService {
+    private static final String FOX_APP_PACKAGE = "com.foxwq.yhwqgl";
     private static final int MAX_MOVES = 1000;
     private static final long TARGET_TOTAL_MS = 10_000;
     private static final long TARGET_SAVE_RESERVE_MS = 300;
     private static final long FRESH_FRAME_WAIT_MS = 320;
-    private static final long OCR_BACKGROUND_TIMEOUT_MS = 1500;
+    private static final long OCR_BACKGROUND_TIMEOUT_MS = 12_000;
     private static final long TAP_DURATION_MS = 20;
     private static final long PROGRESS_UPDATE_INTERVAL_MS = 150;
     private static final double FAST_FRAME_MIN_CONFIDENCE = 0.78;
@@ -77,6 +79,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
     private volatile boolean running;
     private volatile long terminalSignalUntil;
     private volatile int activeMoveCount;
+    private volatile String targetPackageName = "";
     private WindowManager windowManager;
     private View overlay;
     private TextView overlayStatus;
@@ -92,6 +95,9 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             if (!bitmap.isRecycled()) bitmap.recycle();
         }
     }
+
+    private record SliderTouchProbe(Frame frame, boolean sliderMoved,
+                                    boolean homeBarReacted) {}
 
     private record LightFrame(Bitmap bitmap, BoardFrameFingerprint fingerprint,
                               double sliderProgress, long sequence) {
@@ -272,6 +278,12 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             CharSequence packageValue = source.getPackageName();
             String packageName = packageValue == null ? "" : packageValue.toString();
             if (packageName.isBlank() || getPackageName().equals(packageName)) return;
+            String target = targetPackageName;
+            if (target == null || target.isBlank()) {
+                targetPackageName = packageName;
+            } else if (!target.equals(packageName)) {
+                return;
+            }
 
             Rect bounds = new Rect();
             source.getBoundsInScreen(bounds);
@@ -482,6 +494,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         }
         cancelled = false;
         running = true;
+        targetPackageName = FOX_APP_PACKAGE;
         terminalSignalUntil = 0;
         latestRangeSliderEvent.set(null);
         latestTextSliderEvent.set(null);
@@ -531,9 +544,11 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         try {
             meta = MetadataReader.read(first.bitmap(), first.detection().board(),
                     accessibilityTexts, List.of());
+            logMetadata("accessibility", meta);
             enhancedMetadata = startMetadataEnhancement(
                     first.bitmap(), first.detection().board(), accessibilityTexts, meta, metrics);
             publish("認識結果：黒 " + meta.blackDisplay() + "／白 " + meta.whiteDisplay()
+                    + "／手合 " + meta.handicapText
                     + (meta.result.isBlank() ? "" : "／結果 " + meta.result));
         } finally {
             first.recycle();
@@ -819,6 +834,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         copy.whiteRank = source.whiteRank;
         copy.result = source.result;
         copy.handicapText = source.handicapText;
+        copy.handicapRecognized = source.handicapRecognized;
         copy.date = source.date;
         copy.event = source.event;
         copy.place = source.place;
@@ -870,11 +886,17 @@ public final class ReaderAccessibilityService extends AccessibilityService {
             try {
                 List<MetadataReader.UiText> ocrTexts = HeaderTextRecognizer.recognize(
                         header, board, OCR_BACKGROUND_TIMEOUT_MS);
-                return MetadataReader.read(header, board, accessibilityTexts, ocrTexts);
+                logHandicapOcrCandidates(ocrTexts, header.getWidth(), board.top());
+                GameMetadata recognized = MetadataReader.read(
+                        header, board, accessibilityTexts, ocrTexts);
+                logMetadata("ocr", recognized);
+                return recognized;
             } catch (HeaderTextRecognizer.RecognitionTimeoutException timeout) {
                 metrics.ocrTimedOut();
+                Log.w("FoxKifuMetadata", "ocr timeout before handicap recognition");
                 return fallback;
             } catch (Throwable ignored) {
+                Log.w("FoxKifuMetadata", "ocr failed before handicap recognition", ignored);
                 return fallback;
             } finally {
                 metrics.ocrFinished();
@@ -915,13 +937,16 @@ public final class ReaderAccessibilityService extends AccessibilityService {
 
         if (resolved == null) resolved = scanMetadata;
         resolved.initialPosition = scanMetadata.initialPosition;
-        if (scanMetadata.handicap > 1) {
+        if (scanMetadata.handicapRecognized) {
             resolved.handicap = scanMetadata.handicap;
             resolved.handicapText = scanMetadata.handicapText;
+            resolved.handicapRecognized = true;
         }
         resolved.applyDefaultKomi();
+        logMetadata("resolved", resolved);
         publish("確定情報：黒 " + resolved.blackDisplay() + "／白 "
                 + resolved.whiteDisplay()
+                + "／手合 " + resolved.handicapText
                 + (resolved.result.isBlank() ? "" : "／結果 " + resolved.result));
         return resolved;
     }
@@ -934,6 +959,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
                 && !meta.whiteName.contains("不明")
                 && !meta.blackRank.isBlank()
                 && !meta.whiteRank.isBlank()
+                && meta.handicapRecognized
                 && !meta.result.isBlank();
     }
 
@@ -943,13 +969,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         if (isInitialOrInfer(frame.detection().state(), meta)) return frame;
 
         publish("手数バーのツマミを左端へ移動しています…");
-        for (int attempt = 0; attempt < 2 && !geometry.isSliderAtLeft(frame.bitmap()); attempt++) {
-            BoardState beforeDrag = frame.detection().state();
-            PointF thumb = geometry.sliderThumb(frame.bitmap());
-            frame.recycle();
-            gestureSwipe(geometry, thumb, geometry.sliderLeft, 420);
-            frame = awaitStable(geometry, beforeDrag, 3000);
-        }
+        frame = rewindSliderWithCalibratedTouch(geometry, frame);
         if (!geometry.isSliderAtLeft(frame.bitmap())) {
             frame.recycle();
             throw new IllegalStateException("手数操作バーのツマミを左端へ移動できません");
@@ -978,20 +998,199 @@ public final class ReaderAccessibilityService extends AccessibilityService {
         throw new IllegalStateException("初期局面への巻き戻しが上限を超えました");
     }
 
-    private boolean isInitialOrInfer(BoardState state, GameMetadata meta) {
-        if (BoardAnalyzer.isInitial(state, meta.handicap)) return true;
-        return meta.handicap == 0 && inferHandicapAtBeginning(state, meta);
+    /** Prefers a slider-only swipe, then falls back to left-track taps. */
+    private Frame rewindSliderWithCalibratedTouch(ScreenGeometry geometry, Frame frame)
+            throws Exception {
+        if (geometry.isSliderAtLeft(frame.bitmap())) return frame;
+        float swipeY = geometry.usesHomeIndicatorAdjustedTouch()
+                ? sliderOnlySwipeYForVisualControl(
+                        geometry.visualControlY(), geometry.screenHeight())
+                : geometry.sliderLeft.y;
+        publish("スライダだけが反応する位置で巻き戻しています（Y=" + swipeY + "）");
+        SliderTouchProbe swipe = swipeSliderAtY(
+                geometry, frame, swipeY, geometry.sliderLeft.x);
+        frame = swipe.frame();
+        if (!swipe.homeBarReacted() && geometry.isSliderAtLeft(frame.bitmap())) return frame;
+
+        float tapY = geometry.usesHomeIndicatorAdjustedTouch()
+                ? operationYForVisualControl(
+                        geometry.visualControlY(), geometry.screenHeight())
+                : geometry.sliderLeft.y;
+        publish("スワイプだけでは戻りきらないため左端をタップします（Y=" + tapY + "）");
+        for (int attempt = 0; attempt < 3; attempt++) {
+            SliderTouchProbe probe = tapSliderAtY(
+                    geometry, frame, tapY, geometry.sliderLeft.x);
+            frame = probe.frame();
+            if (probe.homeBarReacted()) {
+                frame.recycle();
+                throw new IllegalStateException("調整したY座標でホームバーが反応しました");
+            }
+            if (geometry.isSliderAtLeft(frame.bitmap())) return frame;
+            if (!probe.sliderMoved()) {
+                frame.recycle();
+                throw new IllegalStateException("調整したY座標のタップでスライダを操作できません");
+            }
+        }
+        frame.recycle();
+        throw new IllegalStateException("安全なタップを繰り返してもツマミを左端へ移動できません");
     }
 
-    private boolean inferHandicapAtBeginning(BoardState state, GameMetadata meta) {
+    private SliderTouchProbe swipeSliderAtY(ScreenGeometry geometry, Frame frame,
+                                             float y, float targetX) throws Exception {
+        double beforeProgress = geometry.sliderProgress(frame.bitmap());
+        BoardState before = frame.detection().state();
+        PointF thumb = geometry.sliderThumb(frame.bitmap());
+        PointF from = pointAtY(geometry, thumb.x, y);
+        PointF to = pointAtY(geometry, targetX, y);
+        frame.recycle();
+        gestureSwipe(geometry, from, to, 420);
+        return awaitSliderGestureResult(geometry, before, beforeProgress);
+    }
+
+    private SliderTouchProbe tapSliderAtY(ScreenGeometry geometry, Frame frame,
+                                          float y, float targetX) throws Exception {
+        double beforeProgress = geometry.sliderProgress(frame.bitmap());
+        BoardState before = frame.detection().state();
+        PointF target = pointAtY(geometry, targetX, y);
+        frame.recycle();
+        gestureTap(geometry, target);
+        return awaitSliderGestureResult(geometry, before, beforeProgress);
+    }
+
+    private SliderTouchProbe awaitSliderGestureResult(ScreenGeometry geometry,
+                                                       BoardState before,
+                                                       double beforeProgress) throws Exception {
+        boolean homeBarReacted = !targetAppIsForeground();
+        if (homeBarReacted) {
+            performGlobalBack();
+            if (!awaitTargetAppForeground(2500)) {
+                throw new IllegalStateException("ホームバー反応後に野狐の画面へ復帰できません");
+            }
+        }
+        Frame after = awaitStable(geometry, before, 3000);
+        homeBarReacted = homeBarReacted || !targetAppIsForeground();
+        if (homeBarReacted && !awaitTargetAppForeground(1500)) {
+            after.recycle();
+            throw new IllegalStateException("ホームバー反応後に野狐の画面へ復帰できません");
+        }
+        double afterProgress = geometry.sliderProgress(after.bitmap());
+        boolean moved = geometry.isSliderAtLeft(after.bitmap())
+                || progressMovedTowardLeft(beforeProgress, afterProgress);
+        return new SliderTouchProbe(after, moved, homeBarReacted);
+    }
+
+    private static boolean progressMovedTowardLeft(double before, double after) {
+        return before >= 0 && after >= 0 && before - after > 0.008;
+    }
+
+    static float operationYForScore4(int sliderOnlyY, int sliderAndHomeY) {
+        if (sliderAndHomeY <= sliderOnlyY) {
+            throw new IllegalArgumentException("両方反応するY座標はスライダのみのY座標より下側である必要があります");
+        }
+        return sliderOnlyY
+                + (sliderAndHomeY - sliderOnlyY) * (4.0f - 1.0f) / (10.0f - 1.0f);
+    }
+
+    static float operationYForVisualControl(float visualControlY, int screenHeight) {
+        float scale = Math.max(1, screenHeight) / 1280.0f;
+        int sliderOnlyY = Math.round(visualControlY - 40.0f * scale);
+        int sliderAndHomeY = Math.round(visualControlY + 5.0f * scale);
+        return operationYForScore4(sliderOnlyY, sliderAndHomeY);
+    }
+
+    static float sliderOnlySwipeYForVisualControl(float visualControlY, int screenHeight) {
+        float scale = Math.max(1, screenHeight) / 1280.0f;
+        return Math.round(visualControlY - 13.0f * scale);
+    }
+
+    private static PointF pointAtY(ScreenGeometry geometry, float x, float y) {
+        PointF point = new PointF(x, y);
+        geometry.requireSafe(point);
+        return point;
+    }
+
+    private boolean targetAppIsForeground() {
+        String target = targetPackageName;
+        if (target == null || target.isBlank()) return true;
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows != null) {
+                for (AccessibilityWindowInfo window : windows) {
+                    try {
+                        AccessibilityNodeInfo root = window.getRoot();
+                        if (root == null) continue;
+                        try {
+                            CharSequence packageName = root.getPackageName();
+                            if (packageName != null && target.contentEquals(packageName)) return true;
+                        } finally {
+                            root.recycle();
+                        }
+                    } finally {
+                        window.recycle();
+                    }
+                }
+            }
+            return false;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private boolean awaitTargetAppForeground(long timeoutMs) throws InterruptedException {
+        long deadline = SystemClock.uptimeMillis() + Math.max(0L, timeoutMs);
+        do {
+            if (targetAppIsForeground()) return true;
+            long remaining = deadline - SystemClock.uptimeMillis();
+            if (remaining <= 0L) return false;
+            Thread.sleep(Math.min(100L, remaining));
+        } while (true);
+    }
+
+    private boolean isInitialOrInfer(BoardState state, GameMetadata meta) {
+        return reconcileInitialPosition(state, meta);
+    }
+
+    static boolean reconcileInitialPosition(BoardState state, GameMetadata meta) {
+        if (BoardAnalyzer.isInitial(state, 0)) {
+            if (meta.handicap > 1) return false;
+            meta.applyDefaultKomi();
+            return true;
+        }
+        if (BoardAnalyzer.isInitial(state, meta.handicap)) return true;
+        return !meta.handicapRecognized && meta.handicap == 0
+                && inferHandicapAtBeginning(state, meta);
+    }
+
+    private static boolean inferHandicapAtBeginning(BoardState state, GameMetadata meta) {
         int black = state.count(BoardState.BLACK);
         if (black >= 2 && black <= 9 && BoardAnalyzer.isInitial(state, black)) {
             meta.handicap = black;
             meta.handicapText = black + "子";
             meta.applyDefaultKomi();
+            logMetadata("board-inferred", meta);
             return true;
         }
         return false;
+    }
+
+    private static void logMetadata(String stage, GameMetadata meta) {
+        Log.i("FoxKifuMetadata", stage + " handicapText=" + meta.handicapText
+                + " handicap=" + meta.handicap
+                + " recognized=" + meta.handicapRecognized
+                + " komi=" + meta.komi);
+    }
+
+    private static void logHandicapOcrCandidates(List<MetadataReader.UiText> texts,
+                                                  int width, int boardTop) {
+        int rowBottom = boardTop - (int) Math.round(width * .09);
+        int rightEdge = (int) Math.round(width * .58);
+        for (MetadataReader.UiText item : texts) {
+            Rect bounds = item.bounds();
+            if (bounds.centerX() <= rightEdge && bounds.centerY() <= rowBottom) {
+                Log.i("FoxKifuMetadata", "title-candidate text=" + item.text()
+                        + " bounds=" + bounds.flattenToString());
+            }
+        }
     }
 
     /**
@@ -1401,7 +1600,7 @@ public final class ReaderAccessibilityService extends AccessibilityService {
                     return null;
                 }
 
-                shsFramePixels.bind(bitmap, geometry.board, Math.round(geometry.sliderLeft.y));
+                shsFramePixels.bind(bitmap, geometry.board, Math.round(geometry.visualControlY()));
                 PointF thumb = null;
                 if (session.mode() == SliderMode.TEXT) {
                     try {

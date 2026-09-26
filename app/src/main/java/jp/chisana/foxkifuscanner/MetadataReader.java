@@ -27,6 +27,7 @@ public final class MetadataReader {
     private record Tagged(UiText value, int priority) {}
     private record Player(String name, String rank) {}
     private record Scored(String value, int score) {}
+    private record Handicap(String text, int count, boolean recognized) {}
 
     public static GameMetadata read(Bitmap screen, BoardAnalyzer.Region board,
                                     List<UiText> accessibilityTexts) {
@@ -51,7 +52,8 @@ public final class MetadataReader {
 
         String all = join(header, width, false);
         String center = join(header, width, true);
-        return assemble(left, right, leftBlack, all, center);
+        String handicapRow = joinHandicapLabel(header, width, top);
+        return assemble(left, right, leftBlack, all, center, handicapRow);
     }
 
     private static void addHeader(List<Tagged> out, List<UiText> source,
@@ -72,6 +74,21 @@ public final class MetadataReader {
                 continue;
             }
             out.append(tagged.value().text().trim()).append('\n');
+        }
+        return normalize(out.toString());
+    }
+
+    private static String joinHandicapLabel(List<Tagged> items, int width, int boardTop) {
+        int rowTop = Math.max(0, boardTop - (int) Math.round(width * .26));
+        int rowBottom = boardTop - (int) Math.round(width * .09);
+        int rightEdge = (int) Math.round(width * .58);
+        StringBuilder out = new StringBuilder();
+        for (Tagged tagged : items) {
+            Rect bounds = tagged.value().bounds();
+            if (bounds.centerX() <= rightEdge
+                    && bounds.centerY() >= rowTop && bounds.centerY() <= rowBottom) {
+                out.append(tagged.value().text().trim()).append('\n');
+            }
         }
         return normalize(out.toString());
     }
@@ -154,7 +171,7 @@ public final class MetadataReader {
     }
 
     private static GameMetadata assemble(Player left, Player right, boolean leftBlack,
-                                         String all, String center) {
+                                         String all, String center, String handicapSource) {
         GameMetadata meta = new GameMetadata();
         Player black = leftBlack ? left : right;
         Player white = leftBlack ? right : left;
@@ -162,8 +179,10 @@ public final class MetadataReader {
         meta.blackRank = black.rank();
         meta.whiteName = white.name().isBlank() ? "白番不明" : white.name();
         meta.whiteRank = white.rank();
-        meta.handicapText = parseHandicap(all);
-        meta.handicap = handicapCount(meta.handicapText);
+        Handicap handicap = parseHandicap(handicapSource);
+        meta.handicapText = handicap.text();
+        meta.handicap = handicap.count();
+        meta.handicapRecognized = handicap.recognized();
         meta.applyDefaultKomi();
         meta.result = parseResult(center);
         if (meta.result.isBlank()) meta.result = parseResult(all);
@@ -174,8 +193,9 @@ public final class MetadataReader {
 
     static GameMetadata readTextForTest(String left, String center, String right,
                                         boolean leftBlack) {
+        String all = normalize(left + "\n" + center + "\n" + right);
         return assemble(parsePlayerRaw(left), parsePlayerRaw(right), leftBlack,
-                normalize(left + "\n" + center + "\n" + right), normalize(center));
+                all, normalize(center), all);
     }
 
     private static String canonicalRank(String source) {
@@ -205,19 +225,18 @@ public final class MetadataReader {
         return source;
     }
 
-    private static String parseHandicap(String source) {
+    private static Handicap parseHandicap(String source) {
         String text = normalize(source).replaceAll("\\s+", "");
         if (text.contains("定先") || text.contains("先手を譲る") || text.contains("先手譲る")) {
-            return "定先";
+            return new Handicap("定先", 0, true);
         }
-        if (text.contains("互先")) return "互先";
+        if (text.contains("互先")) return new Handicap("互先", 0, true);
+        text = RESULT_FRACTION.matcher(text).replaceAll("");
+        text = text.replaceAll("([2-9２-９二三四五六七八九])子勝ち", "");
         Matcher matcher = Pattern.compile("([2-9２-９二三四五六七八九])子").matcher(text);
-        return matcher.find() ? japaneseInteger(normalizeDigits(matcher.group(1))) + "子" : "互先";
-    }
-
-    private static int handicapCount(String text) {
-        Matcher matcher = Pattern.compile("([2-9])子").matcher(normalizeDigits(text));
-        return matcher.find() ? Integer.parseInt(matcher.group(1)) : 0;
+        if (!matcher.find()) return new Handicap("互先", 0, false);
+        int count = Integer.parseInt(japaneseInteger(normalizeDigits(matcher.group(1))));
+        return new Handicap(count + "子", count, true);
     }
 
     private static String parseRule(String source) {

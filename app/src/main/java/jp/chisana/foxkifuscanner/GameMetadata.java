@@ -12,6 +12,7 @@ public final class GameMetadata {
     public String whiteRank = "";
     public String result = "";
     public String handicapText = "互先";
+    public boolean handicapRecognized = false;
     public String date = LocalDate.now().toString();
     public String event = DEFAULT_EVENT;
     public String place = DEFAULT_PLACE;
