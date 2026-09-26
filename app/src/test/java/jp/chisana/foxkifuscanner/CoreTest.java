@@ -31,12 +31,60 @@ public class CoreTest {
         assertEquals("野狐囲碁", m.place);
     }
 
+    @Test public void fractionalResultIsNotMistakenForHandicap() {
+        GameMetadata m = MetadataReader.readTextForTest(
+                "a532278851\n9級", "白勝ち\n28と1/4子", "chisana\n9級", true);
+        assertEquals("互先", m.handicapText);
+        assertEquals(0, m.handicap);
+        assertFalse(m.handicapRecognized);
+    }
+
+    @Test public void titleHandicapLabelsAreParsed() {
+        GameMetadata even = MetadataReader.readTextForTest(
+                "昇降級戦 互先", "白勝ち\n28と1/4子", "", true);
+        assertEquals("互先", even.handicapText);
+        assertEquals(0, even.handicap);
+        assertTrue(even.handicapRecognized);
+
+        GameMetadata fixedBlack = MetadataReader.readTextForTest(
+                "昇降級戦 定先", "白勝ち\n28と1/4子", "", true);
+        assertEquals("定先", fixedBlack.handicapText);
+        assertEquals(0, fixedBlack.handicap);
+        assertTrue(fixedBlack.handicapRecognized);
+
+        GameMetadata stones = MetadataReader.readTextForTest(
+                "昇降級戦 二子", "白勝ち\n28と1/4子", "", true);
+        assertEquals("2子", stones.handicapText);
+        assertEquals(2, stones.handicap);
+        assertTrue(stones.handicapRecognized);
+    }
+
+    @Test public void emptyInitialBoardPreservesFixedBlackHandicap() {
+        GameMetadata m = MetadataReader.readTextForTest(
+                "昇降級戦 定先", "", "", true);
+        assertTrue(ReaderAccessibilityService.reconcileInitialPosition(
+                new BoardState(new byte[361]), m));
+        assertEquals("定先", m.handicapText);
+        assertEquals(0, m.handicap);
+        assertEquals("0", m.komi);
+    }
+
+    @Test public void emptyInitialBoardRejectsRecognizedStoneHandicap() {
+        GameMetadata m = MetadataReader.readTextForTest(
+                "昇降級戦 二子", "", "", true);
+        assertFalse(ReaderAccessibilityService.reconcileInitialPosition(
+                new BoardState(new byte[361]), m));
+        assertEquals("2子", m.handicapText);
+        assertEquals(2, m.handicap);
+    }
+
     @Test public void commonResultFormsAreParsed() {
         assertEquals("B+R", MetadataReader.parseResult("黒 中盤勝ち"));
         assertEquals("B+R", MetadataReader.parseResult("黒\n中盤勝ち"));
         assertEquals("W+0.5", MetadataReader.parseResult("白 半目勝ち"));
         assertEquals("B+3.5", MetadataReader.parseResult("黒 3目半勝ち"));
         assertEquals("B+1.5", MetadataReader.parseResult("黒\n3/4子"));
+        assertEquals("W+8.5", MetadataReader.parseResult("白 4と1/4子勝ち"));
         assertEquals("0", MetadataReader.parseResult("持碁"));
     }
 

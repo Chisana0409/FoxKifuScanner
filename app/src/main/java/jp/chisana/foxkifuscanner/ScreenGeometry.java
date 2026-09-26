@@ -11,25 +11,32 @@ public final class ScreenGeometry {
     public final PointF sliderLeft;
     public final PointF sliderRight;
     private final int screenWidth;
+    private final int screenHeight;
+    private final float visualControlY;
     private final int safeTop;
     private final int safeBottom;
 
     private ScreenGeometry(BoardAnalyzer.Region board, PointF back, PointF forward,
                            PointF sliderLeft, PointF sliderRight, int screenWidth,
+                           int screenHeight,
+                           float visualControlY,
                            int safeTop, int safeBottom) {
         this.board = board; this.back = back; this.forward = forward;
         this.sliderLeft = sliderLeft; this.sliderRight = sliderRight;
-        this.screenWidth = screenWidth; this.safeTop = safeTop; this.safeBottom = safeBottom;
+        this.screenWidth = screenWidth; this.screenHeight = screenHeight;
+        this.visualControlY = visualControlY;
+        this.safeTop = safeTop; this.safeBottom = safeBottom;
     }
 
     public static ScreenGeometry detect(Bitmap bitmap, BoardAnalyzer.Region board) {
         int w = bitmap.getWidth();
         ControlBarDetector.Result control = ControlBarDetector.detect(new BitmapPixels(bitmap), board);
-        float y = control.y();
+        float visualY = control.y();
+        float touchY = control.touchY();
         ScreenGeometry geometry = new ScreenGeometry(board,
-                new PointF(w * 0.557f, y), new PointF(w * 0.660f, y),
-                new PointF(w * 0.070f, y), new PointF(w * 0.470f, y),
-                w, control.safeTop(), control.safeBottom());
+                new PointF(w * 0.557f, touchY), new PointF(w * 0.660f, touchY),
+                new PointF(w * 0.070f, touchY), new PointF(w * 0.470f, touchY),
+                w, bitmap.getHeight(), visualY, control.safeTop(), control.safeBottom());
         geometry.requireSafe(geometry.back);
         geometry.requireSafe(geometry.forward);
         geometry.requireSafe(geometry.sliderLeft);
@@ -50,7 +57,7 @@ public final class ScreenGeometry {
 
     public PointF sliderThumb(BoardAnalyzer.Pixels pixels) {
         ControlBarDetector.Thumb thumb = ControlBarDetector.detectThumb(
-                pixels, Math.round(sliderLeft.y));
+                pixels, Math.round(visualControlY));
         if (thumb.centerX() < 0) {
             throw new IllegalStateException("手数操作バーのツマミ位置を検出できません");
         }
@@ -61,14 +68,14 @@ public final class ScreenGeometry {
 
     public boolean isSliderAtLeft(Bitmap bitmap) {
         ControlBarDetector.Thumb thumb = ControlBarDetector.detectThumb(
-                new BitmapPixels(bitmap), Math.round(sliderLeft.y));
+                new BitmapPixels(bitmap), Math.round(visualControlY));
         if (thumb.centerX() < 0) return false;
         return Math.abs(thumb.centerX() - sliderLeft.x) <= Math.max(6, screenWidth * 0.015f);
     }
 
     public double sliderProgress(Bitmap b) {
         ControlBarDetector.Thumb thumb = ControlBarDetector.detectThumb(
-                new BitmapPixels(b), Math.round(sliderLeft.y));
+                new BitmapPixels(b), Math.round(visualControlY));
         if (thumb.centerX() < 0) return -1;
         double progress = (thumb.centerX() - sliderLeft.x)
                 / Math.max(1.0, sliderRight.x - sliderLeft.x);
@@ -90,6 +97,26 @@ public final class ScreenGeometry {
         return Math.max(1f, sliderRight.x - sliderLeft.x);
     }
 
+    float visualControlY() {
+        return visualControlY;
+    }
+
+    int screenHeight() {
+        return screenHeight;
+    }
+
+    boolean usesHomeIndicatorAdjustedTouch() {
+        return sliderLeft.y < visualControlY - 1.0f;
+    }
+
+    int safeTopY() {
+        return safeTop;
+    }
+
+    int safeBottomY() {
+        return safeBottom;
+    }
+
     public double sliderProgressForX(float x) {
         double progress = (x - sliderLeft.x) / sliderTrackWidth();
         return Math.max(0.0, Math.min(1.0, progress));
@@ -108,6 +135,6 @@ public final class ScreenGeometry {
         if (bounds == null || bounds.isEmpty()) return false;
         int yTolerance = Math.max(20, Math.round(screenWidth * 0.035f));
         return bounds.centerY() >= safeTop && bounds.centerY() <= safeBottom
-                && Math.abs(bounds.centerY() - sliderLeft.y) <= yTolerance;
+                && Math.abs(bounds.centerY() - visualControlY) <= yTolerance;
     }
 }
